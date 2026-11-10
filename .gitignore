@@ -1,0 +1,31 @@
+# Local working data and build outputs — never committed.
+output/
+tray/bin/
+tray/obj/
+tray/build/
+node_modules/
+*.log
+*.zip
+*.lnk
+
+# Backups created by atomic writes (pc_tools, tray, scripts).
+*.bak*
+
+# Secrets and machine-local state. The installer generates these fresh
+# on every machine; they must never enter the repository.
+config.env
+tokens.json
+tunnel_key*
+tray-config.json
+
+# Test outputs that embed plaintext (test-only) tokens.
+tokens-out.json
+
+# .NET tool and test outputs; machine-local connection registry.
+**/bin/
+**/obj/
+connections-v2.json*
+# runtime secrets and logs (audit 2026-11-10)
+oauth.json
+audit.jsonl
+journal.jsonl

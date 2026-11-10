@@ -1,0 +1,113 @@
+name: Build release
+
+# The repository holds SOURCE ONLY. The installable product is a Release
+# asset: a zip with the prebuilt self-contained tray exe, the server with
+# dependencies preinstalled, and the installer. Nothing is built on the
+# end user's PC: no .NET SDK, no npm install there.
+#
+# Trigger: push a tag like v0.1.0-test, or run manually (workflow_dispatch,
+# which creates a dev-<run-number> release). Works on private repos too;
+# only the download step differs (private releases need an authenticated
+# download, e.g. from the Releases page in the browser).
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build tray (self-contained single-file exe)
+        shell: powershell
+        run: .\tray\build-tray.ps1
+
+      - name: Install server dependencies
+        shell: powershell
+        run: npm ci --omit=dev
+        working-directory: server
+
+      - name: Registry and CLI tests
+        shell: powershell
+        run: |
+          dotnet run --project tests/connections-v2/Tests.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { throw "Registry tests failed" }
+          dotnet build tools/ConnectionCtl/ConnectionCtl.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { throw "CLI build failed" }
+          & ./tests/connections-v2/cli-smoke.ps1
+          & ./tests/installer-smoke.ps1
+          & ./tests/onboarding-helpers.ps1
+
+      - name: Native runtime and isolated server tests
+        shell: powershell
+        run: |
+          dotnet run --project tests/connections-runtime/RuntimeTests.csproj -c Release -- output/renders
+          if ($LASTEXITCODE -ne 0) { throw "Native runtime tests failed" }
+          node tests/connections-runtime/server-proof.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Isolated server tests failed" }
+          node tests/security-v04.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Server security tests failed" }
+          node tests/isolated-v04.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Older v0.4 server suites failed" }
+
+      - name: Stage release package
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          # The tray launches ServerDir\server.mjs.
+          New-Item -ItemType Directory -Force -Path staging/server, staging/tray/build, staging/installer | Out-Null
+          Copy-Item server/server.mjs staging/server/server.mjs
+          Copy-Item AGENT_INSTALL.md, agent-manifest.json, LICENSE, THIRD_PARTY_NOTICES.md staging/
+          New-Item -ItemType Directory -Force -Path staging/tools, staging/docs | Out-Null
+          Copy-Item tools/Configure-Connection.ps1, tools/Onboarding.Common.ps1, tools/Onboarding.Ngrok.ps1, tools/Test-LocalMcp.ps1, tools/Setup-Ngrok.ps1 staging/tools/
+          Copy-Item docs/AGENT_CONNECTIONS.md, docs/RELEASE_NOTES.md staging/docs/
+          Copy-Item server/package.json, server/package-lock.json, server/tokens-cli.mjs, server/config.env.example staging/server/
+          Copy-Item server/node_modules staging/server/node_modules -Recurse
+          Copy-Item tray/build/ZeroIDE-MCP.exe staging/tray/build/
+          Copy-Item installer/* staging/installer/ -Recurse
+
+      - name: Verify package contract and installer syntax
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          foreach ($path in @('AGENT_INSTALL.md','agent-manifest.json','LICENSE','THIRD_PARTY_NOTICES.md','tools/Configure-Connection.ps1','tools/Onboarding.Common.ps1','tools/Onboarding.Ngrok.ps1','tools/Test-LocalMcp.ps1','tools/Setup-Ngrok.ps1','docs/AGENT_CONNECTIONS.md','server/server.mjs','server/node_modules/@modelcontextprotocol/sdk/package.json','tray/build/ZeroIDE-MCP.exe','installer/install.ps1')) {
+            if (-not (Test-Path (Join-Path staging $path))) { throw "Package is missing $path" }
+          }
+          $errors = $null
+          [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path staging/installer/install.ps1), [ref]$null, [ref]$errors) | Out-Null
+          if ($errors.Count) { throw "Installer has syntax errors" }
+          $forbidden = Get-ChildItem staging -Recurse -File | Where-Object { $_.Name -in @('config.env','tray-config.json','tokens.json','oauth.json','connections-v2.json','connection-client.json') -or $_.Name -like '*.token' -or $_.Name -like 'tunnel_key*' }
+          if ($forbidden) { throw "Machine-local state found in package" }
+
+      - name: Pack zip
+        shell: powershell
+        run: |
+          Compress-Archive -Path staging/* -DestinationPath zeroide-mcp.zip
+          $hash = (Get-FileHash zeroide-mcp.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$hash  zeroide-mcp.zip" | Set-Content zeroide-mcp.zip.sha256 -Encoding ASCII
+
+      - name: Create release and upload asset
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = if ($env:GITHUB_REF_TYPE -eq "tag") { $env:GITHUB_REF_NAME } else { "dev-$env:GITHUB_RUN_NUMBER" }
+          $flags = @()
+          if ($tag.Contains('-')) { $flags += '--prerelease' }
+          gh release create $tag --target $env:GITHUB_SHA --title "ZeroIDE MCP $tag" --notes-file docs/RELEASE_NOTES.md @flags zeroide-mcp.zip zeroide-mcp.zip.sha256
+          if ($LASTEXITCODE -ne 0) { throw "Release publication failed" }

@@ -1,0 +1,73 @@
+{
+    "agentReadFirst":  "AGENT_INSTALL.md",
+    "artifacts":  [
+                      "ZeroIDE-MCP.exe",
+                      "server/server.mjs",
+                      "server/config.env",
+                      "runtime/node.exe",
+                      "tools/Configure-Connection.ps1",
+                      "docs/AGENT_CONNECTIONS.md",
+                      "Start Menu shortcut: ZeroIDE MCP",
+                      "tools/Onboarding.Common.ps1",
+                      "tools/Onboarding.Ngrok.ps1",
+                      "tools/Test-LocalMcp.ps1",
+                      "tools/Setup-Ngrok.ps1"
+                  ],
+    "entryPoint":  "installer/install.ps1",
+    "errors":  {
+                   "DOWNLOAD_FAILED":  "Retry once, then show the owner the error tail (no secrets) and stop.",
+                   "EXE_MISSING":  "Package is broken (source tree, not a release zip): stop and ask the owner for zeroide-mcp.zip from Releases.",
+                   "PORT_BUSY":  "Existing install or foreign process on port 39011: stop and ask the owner (Update / Restore / Delete, or Free port).",
+                   "SERVER_OFF_BEFORE_ENABLE":  "Expected, not an error: the tray starts with the server OFF until the owner presses Enable."
+               },
+    "installCommand":  "powershell -ExecutionPolicy Bypass -File \"installer/install.ps1\"",
+    "installPaths":  [
+                         "local"
+                     ],
+    "installsTo":  "%LOCALAPPDATA%\\ZeroIDE-MCP",
+    "language":  "en",
+    "pathQuestion":  "before-install",
+    "paths":  [
+                  "local",
+                  "lan",
+                  "quick-tunnel",
+                  "own-domain",
+                  "own-vps",
+                  "tailscale"
+              ],
+    "product":  "zeroide-mcp",
+    "requires":  {
+                     "admin":  false,
+                     "internet":  true,
+                     "os":  "Windows 10/11",
+                     "powershell":  "5.1+"
+                 },
+    "secrets":  {
+                    "mayShow":  [
+                                    "Tunnel Public Key"
+                                ],
+                    "neverPrint":  [
+                                       "MCP token",
+                                       "provider account keys",
+                                       "local control secret",
+                                       "OAuth credentials"
+                                   ],
+                    "tokenLocation":  "%LOCALAPPDATA%\\ZeroIDE-MCP\\server\\config.env",
+                    "installerPrintsSecrets":  false
+                },
+    "verify":  {
+                   "expectedTools":  14,
+                   "port":  39011,
+                   "toolsList":  "http://127.0.0.1:39011/mcp",
+                   "toolsListAcceptHeader":  "application/json, text/event-stream",
+                   "clientName":  "ZeroIDE connection verifier"
+               },
+    "version":  "0.3.0",
+    "onboarding":  {
+                       "localCheck":  "tools/Test-LocalMcp.ps1",
+                       "preferredAuthentication":  "OAuth, otherwise named scoped expiring token",
+                       "welcome":  "Explain project and ask AI client before install",
+                       "firstNgrok":  "tools/Setup-Ngrok.ps1 -OwnerChoseNgrok",
+                       "completion":  "Real client signs in and verifies tools; local_ready and awaiting_client are not completion"
+                   }
+}

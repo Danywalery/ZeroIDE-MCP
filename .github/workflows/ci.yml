@@ -1,0 +1,98 @@
+name: CI
+
+# Runs the test suite on every push and pull request. Nothing is packaged
+# or published and the token is read-only. release.yml repeats the same
+# checks before it builds a release.
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: No machine-local state in the repository
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $names = @('config.env','tray-config.json','tokens.json','oauth.json','connections-v2.json','connection-client.json')
+          $hits = @(git ls-files | Where-Object { $leaf = Split-Path $_ -Leaf; $leaf -in $names -or $leaf -like '*.token' -or $leaf -like 'tunnel_key*' })
+          if ($hits.Count) { throw ("Machine-local state is tracked: " + ($hits -join ', ')) }
+          "No machine-local state tracked"
+
+      - name: Installer Node pin matches nodejs.org
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          $inst = Get-Content -Raw installer/install.ps1
+          $ver = [regex]::Match($inst, '\$nodeVersion = "(v[0-9.]+)"').Groups[1].Value
+          $pin = [regex]::Match($inst, '\$nodeSha256 = "([0-9a-f]{64})"').Groups[1].Value
+          if (-not $ver -or -not $pin) { throw "Node version or SHA-256 pin not found in install.ps1" }
+          $sums = (Invoke-WebRequest -UseBasicParsing "https://nodejs.org/dist/$ver/SHASUMS256.txt").Content
+          $line = @($sums -split '\r?\n' | Where-Object { $_ -match ('  node-' + [regex]::Escape($ver) + '-win-x64\.zip$') })
+          if ($line.Count -ne 1) { throw "No unique checksum for node-$ver-win-x64.zip on nodejs.org" }
+          if ($line[0].Split(' ')[0].Trim() -ne $pin) { throw "install.ps1 pin differs from nodejs.org SHASUMS256.txt" }
+          "Node $ver pin matches nodejs.org"
+
+      - name: Build tray (same script as the release)
+        shell: powershell
+        run: .\tray\build-tray.ps1
+
+      - name: Install server dependencies
+        shell: powershell
+        run: npm ci --omit=dev
+        working-directory: server
+
+      - name: Server syntax
+        shell: powershell
+        run: |
+          node --check server/server.mjs
+          if ($LASTEXITCODE -ne 0) { throw "server.mjs has syntax errors" }
+
+      - name: Isolated server tests
+        shell: powershell
+        run: |
+          node tests/connections-runtime/server-proof.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Isolated server tests failed" }
+          node tests/security-v04.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Server security tests failed" }
+          node tests/isolated-v04.mjs
+          if ($LASTEXITCODE -ne 0) { throw "Older v0.4 server suites failed" }
+
+      - name: Registry and CLI tests
+        shell: powershell
+        run: |
+          dotnet run --project tests/connections-v2/Tests.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { throw "Registry tests failed" }
+          dotnet build tools/ConnectionCtl/ConnectionCtl.csproj -c Release
+          if ($LASTEXITCODE -ne 0) { throw "CLI build failed" }
+          & ./tests/connections-v2/cli-smoke.ps1
+          & ./tests/installer-smoke.ps1
+          & ./tests/onboarding-helpers.ps1
+
+      - name: Native runtime tests
+        shell: powershell
+        run: |
+          dotnet run --project tests/connections-runtime/RuntimeTests.csproj -c Release -- output/renders
+          if ($LASTEXITCODE -ne 0) { throw "Native runtime tests failed" }

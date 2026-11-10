@@ -1,0 +1,1 @@
+{"dependencies":{"@modelcontextprotocol/sdk":"^1.10.0","express":"^4.19.2","express-rate-limit":"^7.4.0","zod":"^3.23.8"},"description":"ZeroIDE MCP server for Windows (zeroide-mcp)","name":"zeroide-mcp","private":true,"scripts":{"start":"node server.mjs"},"type":"module","version":"0.3.0"}
