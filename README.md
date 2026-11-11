@@ -8,6 +8,12 @@ ZeroIDE MCP is an [MCP](https://modelcontextprotocol.io) server with a Windows t
 
 > **Status: 0.3.0, the first public release.** The automated suites pass in CI, but installation on a clean PC with every AI client is not fully qualified yet. See [Known limits](#known-limits).
 
+## Demo
+
+See ZeroIDE MCP in action.
+
+https://github.com/user-attachments/assets/525d61c6-c8bc-4902-a694-90eb2ba04891
+
 ## What it is for
 
 - **Any agent, wherever it runs.** A web chat in the browser (ChatGPT, Claude, Notion or another one with MCP support), a coding agent on this PC (Claude Code, Cursor, Codex) or an agent on another computer: each of them can control this PC with the same tools. The agent does not have to run on the PC it controls.
@@ -34,6 +40,10 @@ It is **not a sandbox**: allowed commands run with your Windows user's permissio
 - An AI client with MCP support. Cloud and web clients need a reachable HTTPS address, for example through ngrok. An agent on another of your PCs can use a private network such as Tailscale instead.
 
 ## Install
+
+Watch a real setup and first task with Notion.
+
+https://github.com/user-attachments/assets/d63313c4-a18b-4e34-800a-dda48920bb82
 
 1. Open the **Releases** page of this repository and download `zeroide-mcp.zip` (not the "Source code" archives). You can compare its hash with `zeroide-mcp.zip.sha256`:
    ```powershell
