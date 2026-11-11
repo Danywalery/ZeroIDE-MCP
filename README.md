@@ -6,7 +6,7 @@ ZeroIDE MCP is an [MCP](https://modelcontextprotocol.io) server with a Windows t
 
 Русская версия: [README.ru.md](README.ru.md)
 
-> **Status: 0.3.0, the first public release.** The automated suites pass in CI, but installation on a clean PC with every AI client is not fully qualified yet. See [Known limits](#known-limits).
+> **Status: 0.3.0, the first public release.** The automated suites pass in CI. Installation from scratch was tested on a laptop with an AI agent; not all installation scenarios or AI clients have been tested. See [Known limits](#known-limits).
 
 ## Demo
 
@@ -78,7 +78,7 @@ The repository holds source only; releases are built by GitHub Actions. To build
 
 - The release package and the tray app are not code-signed yet, so Windows SmartScreen may warn.
 - The tray targets .NET 8, whose Microsoft support ends on 10 November 2026. A move to a newer .NET is planned.
-- Not qualified yet: clean-PC onboarding with each AI client, recovery after a reboot or crash, public access through Cloudflare or Tailscale Funnel.
+- Not yet fully tested: installation and onboarding across all scenarios and AI clients; recovery after a reboot or crash; public access through Cloudflare or Tailscale Funnel.
 - Tailscale has no built-in helper in the tray yet: an agent sets it up by hand using the general connection steps in [docs/AGENT_CONNECTIONS.md](docs/AGENT_CONNECTIONS.md). Access over a tailnet address was checked during development.
 - Request limits count per client address as the server sees it. Behind a tunnel all remote traffic shares one address.
 
