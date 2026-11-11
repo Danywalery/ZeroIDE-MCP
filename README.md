@@ -12,7 +12,7 @@ ZeroIDE MCP is an [MCP](https://modelcontextprotocol.io) server with a Windows t
 
 See ZeroIDE MCP in action.
 
-VIDEO_DEMO_PENDING
+https://github.com/user-attachments/assets/525d61c6-c8bc-4902-a694-90eb2ba04891
 
 ## What it is for
 
@@ -43,7 +43,7 @@ It is **not a sandbox**: allowed commands run with your Windows user's permissio
 
 Watch a real setup and first task with Notion.
 
-VIDEO_SETUP_PENDING
+https://github.com/user-attachments/assets/d63313c4-a18b-4e34-800a-dda48920bb82
 
 1. Open the **Releases** page of this repository and download `zeroide-mcp.zip` (not the "Source code" archives). You can compare its hash with `zeroide-mcp.zip.sha256`:
    ```powershell
