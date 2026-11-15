@@ -22,6 +22,8 @@ https://github.com/user-attachments/assets/525d61c6-c8bc-4902-a694-90eb2ba04891
 
 Each PC keeps its own approvals, tokens and audit log: a token for one PC does not work on another.
 
+![14 MCP tools: commands, files, screen, messages to you, records](docs/media/tools.png)
+
 ## Features
 
 - **14 MCP tools:** PowerShell commands (including background jobs and their output), files (read, write, edit, list, search), task status, messages to the owner, screenshots, the audit log and an agent journal.
