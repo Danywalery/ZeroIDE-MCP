@@ -8,15 +8,19 @@
 #   5. Generates an SSH keypair only when SshTarget is explicitly supplied
 #   6. Creates the tray-config.json and a Start Menu shortcut
 # It does NOT enable autostart and does NOT start anything.
+# -Update replaces the app, server and helpers of an existing installation and keeps
+# config.env, tray-config.json, tokens, connections and logs. The app must be closed.
 #
 # Run from the unpacked package root:  powershell -ExecutionPolicy Bypass -File installer\install.ps1
+# The setup wizard (ZeroIDE-MCP.exe started from the unpacked package) runs this same script.
 
 [CmdletBinding()]
 param(
     [string]$ProjectDir = "",
     [int]$Port = 39011,
     [int]$RemotePort = 39003,
-    [string]$SshTarget = ""
+    [string]$SshTarget = "",
+    [switch]$Update
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,32 +35,41 @@ $nodeUrl = "https://nodejs.org/dist/$nodeVersion/node-$nodeVersion-win-x64.zip"
 
 function Step($msg) { Write-Host "`n=== $msg ===" -ForegroundColor Cyan }
 
-# This is a fresh-install entry point, not an in-place updater.
-if (Test-Path $dest) { throw "ZeroIDE-MCP already exists. Stop and ask the owner whether to update, restore or delete it." }
-# Builds made before the rename installed under the working name AgentPower and use the same ports.
-$legacyDest = Join-Path $env:LOCALAPPDATA "AgentPower"
-if (Test-Path $legacyDest) { throw "An earlier installation exists in $legacyDest (old name AgentPower). Stop and ask the owner whether to keep, migrate or delete it; do not run both at once." }
-foreach ($required in @('tray\build\ZeroIDE-MCP.exe','server\server.mjs','tools\Configure-Connection.ps1','tools\Onboarding.Common.ps1','tools\Onboarding.Ngrok.ps1','tools\Test-LocalMcp.ps1','tools\Setup-Ngrok.ps1','docs\AGENT_CONNECTIONS.md')) {
+if ($Update) {
+    # In-place update: only the shipped program files change; machine-local state stays.
+    if (-not (Test-Path $dest)) { throw "Nothing to update: $dest does not exist. Run without -Update for a fresh installation." }
+    $running = Get-Process -Name 'ZeroIDE-MCP' -ErrorAction SilentlyContinue | Where-Object { $_.Path -and $_.Path.StartsWith($dest, [StringComparison]::OrdinalIgnoreCase) }
+    if ($running) { throw "ZeroIDE MCP is running. Exit it from the tray icon, then run the update again." }
+} else {
+    # This is a fresh-install entry point, not an in-place updater (use -Update for that).
+    # tray-config.json is written last, so a folder without it is an interrupted installation: finish it instead of refusing.
+    if (Test-Path (Join-Path $dest "tray-config.json")) { throw "ZeroIDE-MCP already exists. Stop and ask the owner whether to update (-Update), restore or delete it." }
+    if (Test-Path $dest) { Write-Host "An unfinished installation was found in $dest (no tray-config.json); completing it." -ForegroundColor Yellow }
+    # Builds made before the rename installed under the working name AgentPower and use the same ports.
+    $legacyDest = Join-Path $env:LOCALAPPDATA "AgentPower"
+    if (Test-Path $legacyDest) { throw "An earlier installation exists in $legacyDest (old name AgentPower). Stop and ask the owner whether to keep, migrate or delete it; do not run both at once." }
+}
+# The release zip ships the app at the package root; a source tree builds it into tray\build.
+$trayExe = @((Join-Path $root 'ZeroIDE-MCP.exe'), (Join-Path $root 'tray\build\ZeroIDE-MCP.exe')) | Where-Object { Test-Path $_ } | Select-Object -First 1
+if (-not $trayExe) { throw "Incomplete release package: ZeroIDE-MCP.exe. Download zeroide-mcp.zip from Releases." }
+foreach ($required in @('server\server.mjs','tools\Configure-Connection.ps1','tools\Onboarding.Common.ps1','tools\Onboarding.Ngrok.ps1','tools\Test-LocalMcp.ps1','tools\Setup-Ngrok.ps1','tools\Onboarding.Tailscale.ps1','tools\Setup-Tailscale.ps1','tools\Onboarding.Cloudflare.ps1','tools\Setup-Cloudflare.ps1','docs\AGENT_CONNECTIONS.md')) {
     if (-not (Test-Path (Join-Path $root $required))) { throw "Incomplete release package: $required. Download zeroide-mcp.zip from Releases." }
 }
-Step "Installing into $dest"
+if ($Update) { Step "Updating $dest" } else { Step "Installing into $dest" }
 New-Item -ItemType Directory -Force -Path $dest | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $dest "logs") | Out-Null
 
 Step "Copying server"
-Copy-Item -Recurse -Force (Join-Path $root "server") (Join-Path $dest "server")
+# Contents are merged into an existing server folder; the package never contains config.env.
+New-Item -ItemType Directory -Force -Path (Join-Path $dest "server") | Out-Null
+Copy-Item -Recurse -Force (Join-Path $root "server\*") (Join-Path $dest "server")
 
 Step "Copying tray"
-$trayBuild = Join-Path $root "tray\build"
-if (Test-Path (Join-Path $trayBuild "ZeroIDE-MCP.exe")) {
-    Copy-Item -Force (Join-Path $trayBuild "ZeroIDE-MCP.exe") (Join-Path $dest "ZeroIDE-MCP.exe")
-} else {
-    Write-Warning "ZeroIDE-MCP.exe not found in tray\build -- build the tray first (see docs/BUILDING.md) or use zeroide-mcp.zip from Releases."
-}
+Copy-Item -Force $trayExe (Join-Path $dest "ZeroIDE-MCP.exe")
 
 Step "Copying agent connection helper and instructions"
 New-Item -ItemType Directory -Force -Path (Join-Path $dest 'tools'), (Join-Path $dest 'docs') | Out-Null
-foreach ($helper in @('Configure-Connection.ps1','Onboarding.Common.ps1','Onboarding.Ngrok.ps1','Test-LocalMcp.ps1','Setup-Ngrok.ps1')) {
+foreach ($helper in @('Configure-Connection.ps1','Onboarding.Common.ps1','Onboarding.Ngrok.ps1','Test-LocalMcp.ps1','Setup-Ngrok.ps1','Onboarding.Tailscale.ps1','Setup-Tailscale.ps1','Onboarding.Cloudflare.ps1','Setup-Cloudflare.ps1')) {
     Copy-Item -Force (Join-Path $root ('tools\'+$helper)) (Join-Path $dest 'tools')
 }
 Copy-Item -Force (Join-Path $root 'docs\AGENT_CONNECTIONS.md') (Join-Path $dest 'docs')
@@ -144,6 +157,9 @@ if ($SshTarget -ne '') {
     Write-Host ('TUNNEL PUBLIC KEY: ' + (Get-Content "$keyPath.pub"))
 }
 
+if ($Update -and (Test-Path (Join-Path $dest "tray-config.json"))) {
+    Step "tray-config.json kept"
+} else {
 Step "tray-config.json"
 $trayCfg = @{
     ServerDir            = (Join-Path $dest "server")
@@ -163,6 +179,7 @@ $trayCfg = @{
     DefaultGrantScope    = "tool"
 } | ConvertTo-Json
 $trayCfg | Set-Content -Path (Join-Path $dest "tray-config.json") -Encoding UTF8
+}
 
 Step "Start Menu shortcut"
 $shortcutDir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
@@ -173,6 +190,6 @@ $sc.WorkingDirectory = $dest
 $sc.Save()
 
 Step "Done"
-Write-Host "Installed to $dest"
+if ($Update) { Write-Host "Updated $dest" } else { Write-Host "Installed to $dest" }
 Write-Host "Autostart is OFF. Start 'ZeroIDE MCP' from the Start Menu when you want the agent online."
 Write-Host "Next: follow AGENT_INSTALL.md, then docs\AGENT_CONNECTIONS.md."

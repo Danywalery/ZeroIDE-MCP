@@ -24,7 +24,9 @@ internal class ConnectionDialogBase : Form
     {
         Text = title; StartPosition = FormStartPosition.CenterParent; ClientSize = new Size(650, height); MinimumSize = new Size(590, 430);
         BackColor = Color.FromArgb(20, 23, 29); ForeColor = Color.FromArgb(240, 242, 248); Font = Theme.Font(10);
-        ShowInTaskbar = false; MaximizeBox = false; MinimizeBox = false;
+        ShowInTaskbar = true; MaximizeBox = false; MinimizeBox = false;
+        // Owner-facing prompts (key entry, launch consent) come from the control API without an owner window: keep them on top and activated.
+        TopMost = true; StartPosition = FormStartPosition.CenterScreen; Shown += (_, _) => { Activate(); BringToFront(); };
         Body = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, Padding = new Padding(24) };
         Controls.Add(Body);
     }

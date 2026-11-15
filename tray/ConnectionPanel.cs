@@ -99,7 +99,8 @@ internal sealed partial class SettingsForm
         float ax = x + 20, ay = y + 14 + urlH;
         ax += ConnectionButton(g, ax, ay, I18n.T("Copy", "Копировать"), "connection_copy", () => ConnectionPanelAction("copy"), true) + 10;
         ax += ConnectionButton(g, ax, ay, I18n.T("Check", "Проверить"), "connection_check", () => ConnectionPanelAction("check")) + 10;
-        ConnectionButton(g, ax, ay, I18n.T("Change URL", "Изменить ссылку"), "connection_change", async () => { await _ctx.ChangeConnectionAddressFromUi(this); Invalidate(); });
+        ax += ConnectionButton(g, ax, ay, I18n.T("Change URL", "Изменить ссылку"), "connection_change", async () => { await _ctx.ChangeConnectionAddressFromUi(this); Invalidate(); }) + 10;
+        ConnectionButton(g, ax, ay, I18n.T("Setup wizard", "Мастер настройки"), "connection_wizard", () => _ctx.OpenSetupWizard());
         ConnectionText(g, _ctx.ConnectionCheck, UiCaption, ColTextSecondary, x + 20, ay + 42, inner); y += linkH + 20;
         y = DrawGroupTitle(g, x, y, I18n.T("CHANGE WITH YOUR AGENT", "ПОМЕНЯТЬ ЧЕРЕЗ АГЕНТА"));
         string[] goals = ["url", "type", "fix", "local"];

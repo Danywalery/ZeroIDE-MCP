@@ -1,18 +1,35 @@
-# ZeroIDE MCP 0.3.0
+# ZeroIDE MCP 0.4.0
 
-First public release, for Windows 10/11 (x64). All automated suites pass in this build; installation on a clean PC with each AI client is still being qualified.
+Manual installation, no agent needed. For Windows 10/11 (x64).
+
+## What's new
+
+**Setup wizard.** Unzip and double-click `ZeroIDE-MCP.exe`: the wizard explains what the app does, installs it with one click (preflight, portable Node.js with a verified checksum, a local key that is never shown, no admin rights) and then walks you through the connection step by step: which AI you use, how it reaches this PC, and how to add the URL in your AI client. The agent-led path is still there: the wizard hands you a task for Claude Code, Cursor, Codex or another agent on the PC.
+
+**Connection options, set up for you.**
+- **ngrok** for web chats (ChatGPT, Claude, Notion): sign in, paste the key into the app's own window, approve the launch.
+- **Tailscale** for your other computers: installed if missing, sign-in in the browser, the server is published inside your private network with Tailscale Serve. No public address.
+- **Cloudflare Tunnel** on your own domain: you create the tunnel in Zero Trust, the app runs cloudflared for it.
+- A comparison screen in the wizard explains who can reach the PC with each option, what it is for and what you need.
+
+**Uninstall** in Settings: stops connections, removes the installation folder with all tokens and logs, the Start Menu shortcut and the autostart entry.
+
+**Installer.** `install.ps1 -Update` updates an existing installation in place; an interrupted installation is completed on the next run. The release zip ships the app at the package root.
+
+The same helpers (`tools/Setup-Ngrok.ps1`, `Setup-Tailscale.ps1`, `Setup-Cloudflare.ps1`) serve agents and the wizard alike; see `docs/AGENT_CONNECTIONS.md`. Full list in `CHANGELOG.md`.
 
 ## Install
 
+
 1. Download **zeroide-mcp.zip** from this release, not the "Source code" archives. You can check it against **zeroide-mcp.zip.sha256**: `Get-FileHash .\zeroide-mcp.zip -Algorithm SHA256`.
-2. Extract it and give **AGENT_INSTALL.md** to the AI agent that will install it, or run `powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\install.ps1` from the extracted folder.
+2. Extract it and start **ZeroIDE-MCP.exe** from the extracted folder: the setup wizard explains the app, installs it and sets up the connection to your AI (manually with guidance, or by giving a task to an AI agent on this PC). The command line still works: `powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\install.ps1` (`-Update` for an existing installation).
 3. Start **ZeroIDE MCP** and switch MCP on when you want access to be available.
 
 The installer needs no administrator rights, installs to `%LOCALAPPDATA%\ZeroIDE-MCP`, downloads portable Node.js and checks its pinned SHA-256, refuses to overwrite an existing installation, never prints tokens and does not switch MCP on by itself. The tray and the server dependencies come prebuilt; nothing is compiled on your PC.
 
 Success means a real connection from your AI client, not only a passing local check. Never paste keys or tokens into a chat or a log.
 
-## Changes since the earlier test builds
+## Changes in 0.3.0 (first public release)
 
 **Name**
 

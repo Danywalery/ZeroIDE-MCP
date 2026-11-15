@@ -11,7 +11,11 @@
                       "tools/Onboarding.Common.ps1",
                       "tools/Onboarding.Ngrok.ps1",
                       "tools/Test-LocalMcp.ps1",
-                      "tools/Setup-Ngrok.ps1"
+                      "tools/Setup-Ngrok.ps1",
+                      "tools/Onboarding.Tailscale.ps1",
+                      "tools/Setup-Tailscale.ps1",
+                      "tools/Onboarding.Cloudflare.ps1",
+                      "tools/Setup-Cloudflare.ps1"
                   ],
     "entryPoint":  "installer/install.ps1",
     "errors":  {
@@ -62,12 +66,14 @@
                    "toolsListAcceptHeader":  "application/json, text/event-stream",
                    "clientName":  "ZeroIDE connection verifier"
                },
-    "version":  "0.3.0",
+    "version":  "0.4.0",
     "onboarding":  {
                        "localCheck":  "tools/Test-LocalMcp.ps1",
                        "preferredAuthentication":  "OAuth, otherwise named scoped expiring token",
                        "welcome":  "Explain project and ask AI client before install",
                        "firstNgrok":  "tools/Setup-Ngrok.ps1 -OwnerChoseNgrok",
+                       "firstTailscale":  "tools/Setup-Tailscale.ps1 -OwnerChoseTailscale",
+                       "firstCloudflare":  "tools/Setup-Cloudflare.ps1 -OwnerChoseCloudflare -Hostname <public hostname from the owner>",
                        "completion":  "Real client signs in and verifies tools; local_ready and awaiting_client are not completion"
                    }
 }

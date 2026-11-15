@@ -14,7 +14,16 @@ Use the shipped helpers, not agent-generated code:
 & "$env:LOCALAPPDATA\ZeroIDE-MCP\tools\Test-LocalMcp.ps1"
 # Only after the owner chooses ngrok, with MCP enabled and no existing public connection/draft:
 & "$env:LOCALAPPDATA\ZeroIDE-MCP\tools\Setup-Ngrok.ps1" -OwnerChoseNgrok
+# Private network between the owner's own computers (no public address). Installs signed official Tailscale if absent (visible installer, admin prompt),
+# waits for the owner's sign-in, requires HTTPS certificates enabled in the tailnet (returns waiting_for_owner ENABLE_HTTPS with the admin URL otherwise),
+# then runs a foreground "tailscale serve" that the app starts and stops with MCP:
+& "$env:LOCALAPPDATA\ZeroIDE-MCP\tools\Setup-Tailscale.ps1" -OwnerChoseTailscale
+# Owner's own domain. The owner creates the tunnel and its public hostname (-> http://localhost:39011) in Cloudflare Zero Trust and keeps the tunnel token ready;
+# the helper installs signed official cloudflared if absent, asks for the token in the protected PC window and runs it with --token-file:
+& "$env:LOCALAPPDATA\ZeroIDE-MCP\tools\Setup-Cloudflare.ps1" -OwnerChoseCloudflare -Hostname mcp.example.com
 ```
+
+All three helpers share the same result contract (`awaiting_client`, `waiting_for_owner`, `cancelled`, `needs_attention`) and the same rules: never print keys, never bypass consent, never adopt an existing connection or draft.
 
 The first performs an authenticated, read-only protocol check and explicitly closes its session. The second installs signed official ngrok if absent, shows progress, opens protected key entry, and drives the existing coordinator through preparation, owner launch consent, address discovery, identity check and activation. Run the second call in a background job so personal sign-in/consent can take time. Do not issue duplicate calls while the original job waits.
 

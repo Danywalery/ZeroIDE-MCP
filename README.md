@@ -6,7 +6,7 @@ ZeroIDE MCP is an [MCP](https://modelcontextprotocol.io) server with a Windows t
 
 Русская версия: [README.ru.md](README.ru.md)
 
-> **Status: 0.3.0, the first public release.** The automated suites pass in CI. Installation from scratch was tested on a laptop with an AI agent; not all installation scenarios or AI clients have been tested. See [Known limits](#known-limits).
+> **Status: 0.4.0.** Manual installation with a step-by-step wizard, no agent needed. The automated suites pass in CI; the manual path was tested on a clean PC (install, ngrok) and on a development PC (Tailscale, uninstall). Not all AI clients have been tested. See [Known limits](#known-limits).
 
 ## Demo
 
@@ -49,14 +49,13 @@ https://github.com/user-attachments/assets/d63313c4-a18b-4e34-800a-dda48920bb82
    ```powershell
    Get-FileHash .\zeroide-mcp.zip -Algorithm SHA256
    ```
-2. Extract the archive.
-3. The easiest way is to give `AGENT_INSTALL.md` from the archive to your AI agent and let it guide you. Or install it yourself from the extracted folder:
-   ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\install.ps1
-   ```
-4. Start **ZeroIDE MCP** from the Start menu and switch MCP on when the AI needs access. Set up the connection for your AI client in the tray; [docs/AGENT_CONNECTIONS.md](docs/AGENT_CONNECTIONS.md) has the details for agents.
+2. Extract the archive and start **ZeroIDE-MCP.exe** from the extracted folder. The setup wizard opens: it explains what the app does and offers two ways in.
+   - **Manually, with guidance.** The wizard installs everything, then asks which AI you want to connect (an agent on this PC, ChatGPT, Claude, Notion, another computer) and walks you through the connection. For a web chat it recommends ngrok and does the technical part; you only sign in to ngrok, paste the key into the app's window and approve the launch. For another computer of yours it sets up Tailscale (installs it if needed, waits for your sign-in, publishes the server inside your tailnet with Tailscale Serve). With your own domain it runs cloudflared for a Cloudflare Tunnel you create in Zero Trust. An address of your own goes in as "I already have an address".
+   - **With an AI agent on this PC.** The wizard gives you a task to paste into Claude Code, Cursor, Codex or another agent; the agent follows `AGENT_INSTALL.md` from the archive.
+   If you prefer the command line, the same installer runs with `powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\install.ps1` (add `-Update` to update an existing installation).
+3. Switch MCP on in the tray when the AI needs access. To remove everything later, use **Uninstall** in Settings: it stops connections, deletes the installation folder with all tokens and logs, the Start Menu shortcut and the autostart entry. The connection wizard is always available again under **Connection**; [docs/AGENT_CONNECTIONS.md](docs/AGENT_CONNECTIONS.md) has the details for agents.
 
-The installer puts everything in `%LOCALAPPDATA%\ZeroIDE-MCP`, refuses to overwrite an existing installation, never prints tokens and does not switch MCP on by itself. It uses the local ports 39011 and 39012.
+The installer puts everything in `%LOCALAPPDATA%\ZeroIDE-MCP`, never prints tokens and does not switch MCP on by itself. It uses the local ports 39011 and 39012. Windows SmartScreen may warn about an unsigned app on first start; the exe is the same one published in the release.
 
 ## Repository layout
 

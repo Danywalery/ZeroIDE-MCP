@@ -60,6 +60,7 @@ internal sealed class TrayConfig
     public string TrayMenuMode { get; set; } = "classic"; // classic | panel | mini
     public string ApprovalSound { get; set; } = "chime";  // chime | ping | bell | none
     public string Language { get; set; } = "en";         // en | ru
+    public bool SetupCompleted { get; set; } = false;     // connect wizard finished or dismissed once
 }
 
 /// <summary>Live mirror of the screenshot-archive settings for tray-side
@@ -153,6 +154,18 @@ internal static class Program
     [STAThread]
     private static void Main()
     {
+        // Started from an unpacked release package (no tray-config.json next to the exe): run the
+        // setup wizard instead of creating a stray portable installation inside the zip folder.
+        if (SetupLaunch.ShouldRunSetup(out string packageRoot))
+        {
+            using var setupMutex = new Mutex(true, "ZeroIDE-MCP.Setup", out bool setupNew);
+            if (!setupNew) return;
+            ApplicationConfiguration.Initialize();
+            // --step <name> opens a given wizard screen (development aid).
+            string[] args = Environment.GetCommandLineArgs(); int stepArg = Array.IndexOf(args, "--step");
+            Application.Run(new SetupWizardForm(packageRoot, stepArg > 0 && stepArg + 1 < args.Length ? args[stepArg + 1] : ""));
+            return;
+        }
         string logFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ZeroIDE-MCP", "logs", "tray.log");
         using var mutex = new Mutex(true, "ZeroIDE-MCP.SingleInstance", out bool createdNew);
         if (!createdNew)
@@ -298,6 +311,34 @@ internal sealed partial class TrayContext : ApplicationContext
         _poll.Tick += async (_, _) => await PollAsync();
         _poll.Start();
         Log("tray v0.2.1 started (server off)");
+        if (!_cfg.SetupCompleted && !ConnectionIsPublic)
+        {
+            var once = new System.Windows.Forms.Timer { Interval = 700 };
+            once.Tick += (_, _) =>
+            {
+                once.Stop(); once.Dispose(); OpenSetupWizard();
+                string[] args = Environment.GetCommandLineArgs(); int stepArg = Array.IndexOf(args, "--step");
+                if (stepArg > 0 && stepArg + 1 < args.Length) _setupForm?.Navigate(args[stepArg + 1]);
+            };
+            once.Start();
+        }
+    }
+
+    private SetupWizardForm? _setupForm;
+    /// <summary>Connect wizard: which AI, how to reach this PC, hand-off to the client. Reopenable from Connection.</summary>
+    public void OpenSetupWizard()
+    {
+        try
+        {
+            if (_setupForm == null || _setupForm.IsDisposed) { _setupForm = new SetupWizardForm(this); _setupForm.Show(); }
+            else _setupForm.Activate();
+        }
+        catch (Exception ex) { Log("setup wizard error: " + ex.Message); }
+    }
+    public void MarkSetupCompleted()
+    {
+        if (_cfg.SetupCompleted) return;
+        _cfg.SetupCompleted = true; SaveConfig();
     }
 
     private void OnTrayIconMouseUp(object? sender, MouseEventArgs e)

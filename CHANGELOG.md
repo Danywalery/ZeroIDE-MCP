@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.4.0 — 2026-11-15
+
+### Added: setup wizard for people, not only agents
+
+- `ZeroIDE-MCP.exe` started from the unpacked release package opens a setup wizard instead of creating a stray portable copy inside the zip folder. It explains what the app does, offers **Manually, with guidance** or **With an AI agent on this PC** (copies a task that points at `AGENT_INSTALL.md`), runs a preflight (package files, ports 39011/39012, existing or legacy installation) and then runs the same `installer/install.ps1` the agent path uses, with progress and a log.
+- After installation the app opens the connection part of the wizard once: which AI (an agent on this PC, ChatGPT, Claude, Notion, another computer), then local access or internet access. For a web chat it recommends ngrok and drives the shipped `tools/Setup-Ngrok.ps1` helper, so the manual path and the agent path share one implementation: protected key entry, launch consent, address check and activation all happen in the app. Cloudflare Tunnel, Tailscale and existing addresses go through "Enter the address" or a task for an agent. The last screen hands off to the AI client with the URL, generic sign-in steps and a live "client connected" check.
+- **Setup wizard** button in Connection reopens the wizard. `tray-config.json` gains `SetupCompleted`.
+- `installer/install.ps1 -Update` replaces the app, server and helpers of an existing installation and keeps `config.env`, `tray-config.json`, tokens, connections and logs; the app must be closed. The fresh-install path is unchanged.
+- The release zip ships `ZeroIDE-MCP.exe` at the package root (double-click = wizard); the installer also accepts `tray/build/ZeroIDE-MCP.exe` from a source build.
+- An interrupted installation (folder without `tray-config.json`) is completed on the next run instead of being refused; the generated MCP token is kept.
+
+### Added: Tailscale and Cloudflare Tunnel helpers
+
+- `tools/Setup-Tailscale.ps1`: private access from the owner's other computers. Installs signed official Tailscale when missing (visible installer, administrator prompt), waits for the owner's sign-in (opens the auth page), requires HTTPS certificates in the tailnet (`waiting_for_owner` / `ENABLE_HTTPS` with the admin URL otherwise), picks a free Serve port (443, 8443, 10000; existing Serve/Funnel configs are never touched) and runs a foreground `tailscale serve` through the coordinator, so the app starts and stops it with MCP. Scope `Private`.
+- `tools/Setup-Cloudflare.ps1 -Hostname <public hostname>`: the owner creates the tunnel and its public hostname in Cloudflare Zero Trust; the helper installs signed official cloudflared when missing, asks for the tunnel token in the protected PC window and runs `cloudflared tunnel run --token-file` through the coordinator.
+- The wizard's provider screen drives all three helpers; Start switches MCP on, clears a failed attempt's progress and draft, and passes the installation folder explicitly. Owner prompts (key entry, launch consent) are now shown on top of other windows.
+
+### Added: Uninstall
+
+- Settings gains an **Uninstall** section (between Screenshots and About). It lists what is removed and what stays, asks for confirmation, stops the server and managed connections, removes the autostart entry and the Start Menu shortcut, exits, and a detached PowerShell deletes the installation folder with all local data. Accounts and tunnels at ngrok, Cloudflare and Tailscale, and the Tailscale app itself, stay.
+
 ## 0.3.0 — 2026-11-11
 
 First public release: 0.3.0-rc.1 plus the changes below.

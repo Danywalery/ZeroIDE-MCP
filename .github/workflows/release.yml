@@ -1,9 +1,10 @@
 name: Build release
 
 # The repository holds SOURCE ONLY. The installable product is a Release
-# asset: a zip with the prebuilt self-contained tray exe, the server with
-# dependencies preinstalled, and the installer. Nothing is built on the
-# end user's PC: no .NET SDK, no npm install there.
+# asset: a zip with the prebuilt self-contained tray exe at the package root
+# (double-click = setup wizard), the server with dependencies preinstalled,
+# and the installer. Nothing is built on the end user's PC: no .NET SDK, no
+# npm install there.
 #
 # Trigger: push a tag like v0.1.0-test, or run manually (workflow_dispatch,
 # which creates a dev-<run-number> release). Works on private repos too;
@@ -70,22 +71,23 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           # The tray launches ServerDir\server.mjs.
-          New-Item -ItemType Directory -Force -Path staging/server, staging/tray/build, staging/installer | Out-Null
+          New-Item -ItemType Directory -Force -Path staging/server, staging/installer | Out-Null
           Copy-Item server/server.mjs staging/server/server.mjs
           Copy-Item AGENT_INSTALL.md, agent-manifest.json, LICENSE, THIRD_PARTY_NOTICES.md staging/
           New-Item -ItemType Directory -Force -Path staging/tools, staging/docs | Out-Null
-          Copy-Item tools/Configure-Connection.ps1, tools/Onboarding.Common.ps1, tools/Onboarding.Ngrok.ps1, tools/Test-LocalMcp.ps1, tools/Setup-Ngrok.ps1 staging/tools/
+          Copy-Item tools/Configure-Connection.ps1, tools/Onboarding.Common.ps1, tools/Onboarding.Ngrok.ps1, tools/Test-LocalMcp.ps1, tools/Setup-Ngrok.ps1, tools/Onboarding.Tailscale.ps1, tools/Setup-Tailscale.ps1, tools/Onboarding.Cloudflare.ps1, tools/Setup-Cloudflare.ps1 staging/tools/
           Copy-Item docs/AGENT_CONNECTIONS.md, docs/RELEASE_NOTES.md staging/docs/
           Copy-Item server/package.json, server/package-lock.json, server/tokens-cli.mjs, server/config.env.example staging/server/
           Copy-Item server/node_modules staging/server/node_modules -Recurse
-          Copy-Item tray/build/ZeroIDE-MCP.exe staging/tray/build/
+          # The exe sits at the root: started from there it opens the setup wizard, which runs installer/install.ps1.
+          Copy-Item tray/build/ZeroIDE-MCP.exe staging/
           Copy-Item installer/* staging/installer/ -Recurse
 
       - name: Verify package contract and installer syntax
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          foreach ($path in @('AGENT_INSTALL.md','agent-manifest.json','LICENSE','THIRD_PARTY_NOTICES.md','tools/Configure-Connection.ps1','tools/Onboarding.Common.ps1','tools/Onboarding.Ngrok.ps1','tools/Test-LocalMcp.ps1','tools/Setup-Ngrok.ps1','docs/AGENT_CONNECTIONS.md','server/server.mjs','server/node_modules/@modelcontextprotocol/sdk/package.json','tray/build/ZeroIDE-MCP.exe','installer/install.ps1')) {
+          foreach ($path in @('AGENT_INSTALL.md','agent-manifest.json','LICENSE','THIRD_PARTY_NOTICES.md','tools/Configure-Connection.ps1','tools/Onboarding.Common.ps1','tools/Onboarding.Ngrok.ps1','tools/Test-LocalMcp.ps1','tools/Setup-Ngrok.ps1','tools/Onboarding.Tailscale.ps1','tools/Setup-Tailscale.ps1','tools/Onboarding.Cloudflare.ps1','tools/Setup-Cloudflare.ps1','docs/AGENT_CONNECTIONS.md','server/server.mjs','server/node_modules/@modelcontextprotocol/sdk/package.json','ZeroIDE-MCP.exe','installer/install.ps1')) {
             if (-not (Test-Path (Join-Path staging $path))) { throw "Package is missing $path" }
           }
           $errors = $null

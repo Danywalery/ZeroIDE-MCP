@@ -25,6 +25,8 @@ try {
     New-Item -ItemType Directory -Force (Join-Path $temp 'ZeroIDE-MCP') | Out-Null
     $sentinel = Join-Path $temp 'ZeroIDE-MCP\keep.txt'
     [IO.File]::WriteAllText($sentinel, 'unchanged')
+    # A finished installation is marked by tray-config.json (written last); a folder without it is resumed, not refused.
+    [IO.File]::WriteAllText((Join-Path $temp 'ZeroIDE-MCP\tray-config.json'), '{}')
     $env:LOCALAPPDATA = $temp
     $refused = $false
     try { & $installer } catch { $refused = $_.Exception.Message -like '*ZeroIDE-MCP already exists*' }

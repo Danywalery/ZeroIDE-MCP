@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -98,6 +98,7 @@ internal sealed partial class SettingsForm : Form
         new("connection", "Connection", "Подключение", Theme.Info, "link"),
         new("audit", "Journal and audit", "Журнал и аудит", Theme.Accent, "list"),
         new("screenshots", "Screenshots", "Скриншоты", Theme.Info, "image"),
+        new("uninstall", "Uninstall", "Удаление", Theme.Danger, "trash"),
         new("about", "About", "О программе", Theme.TextTertiary, "info"),
     };
 
@@ -414,6 +415,7 @@ internal sealed partial class SettingsForm : Form
         "shieldcheck" => IconKind.ShieldCheck,
         "link" => IconKind.Link,
         "image" => IconKind.Image,
+        "trash" => IconKind.Trash,
         _ => IconKind.About,
     };
 
@@ -483,6 +485,9 @@ internal sealed partial class SettingsForm : Form
                 break;
             case "screenshots":
                 y = DrawScreenshotsContent(g, contentX, contentW, y);
+                break;
+            case "uninstall":
+                y = DrawUninstallContent(g, contentX, contentW, y);
                 break;
             case "about":
                 y = DrawAboutContent(g, contentX, contentW, y);
@@ -1975,6 +1980,7 @@ internal sealed partial class SettingsForm : Form
         "connection" => I18n.T("How AI connects to this PC and which URL to use.", "Как AI подключается к этому ПК и какую ссылку использовать."),
         "audit" => I18n.T("History of tool calls and approval decisions.", "История вызовов инструментов и решений по подтверждениям."),
         "screenshots" => I18n.T("Archive of approved screenshots and its folder.", "Архив одобренных скриншотов и папка для их хранения."),
+        "uninstall" => I18n.T("Remove the app and all its local data from this PC.", "Удалить приложение и все его локальные данные с этого ПК."),
         "about" => I18n.T("App version and file locations.", "Версия приложения и расположение файлов."),
         _ => null,
     };

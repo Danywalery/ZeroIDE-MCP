@@ -11,7 +11,7 @@ End users do not need this page: they install the release package (see the READM
 ## Build
 
 ```powershell
-# Tray app: self-contained single-file exe -> tray\build\ZeroIDE-MCP.exe
+# Tray app: self-contained single-file exe -> tray\build\ZeroIDE-MCP.exe (the release zip puts it at the package root)
 .\tray\build-tray.ps1
 
 # Server dependencies

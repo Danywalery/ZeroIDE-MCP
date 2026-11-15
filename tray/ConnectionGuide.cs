@@ -69,7 +69,7 @@ internal sealed partial class TrayContext
         {
             bool stale = DateTimeOffset.UtcNow - _guideUpdated > TimeSpan.FromMinutes(10);
             return new("guide", stale ? ConnectionTone.Warning : string.IsNullOrEmpty(_guideWaiting) ? ConnectionTone.Info : ConnectionTone.Waiting,
-                stale ? I18n.T("No update from the agent yet", "От агента давно нет обновлений") : !string.IsNullOrEmpty(_guideWaiting) ? I18n.T("Your action is needed", "Нужно твоё действие") : I18n.T("The agent is setting up your connection", "Агент настраивает подключение"),
+                stale ? I18n.T("No update from the agent yet", "От агента давно нет обновлений") : !string.IsNullOrEmpty(_guideWaiting) ? I18n.T("Your action is needed", "Нужно твоё действие") : I18n.T("Your connection is being set up", "Подключение настраивается"),
                 (_guideTitle ?? "") + (!string.IsNullOrEmpty(_guideWaiting) ? "\n" + _guideWaiting : "") + (stale ? I18n.T("\nCheck the agent's chat. Your current address is unchanged.", "\nОткрой чат агента. Текущий адрес не изменён.") : ""),
                 [A("guide_hide", "Hide progress", "Скрыть прогресс")], _guideSteps ?? []);
         }

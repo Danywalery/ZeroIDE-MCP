@@ -30,7 +30,7 @@ If ngrok is chosen, let the owner open `https://dashboard.ngrok.com/get-started/
 
 After the owner agrees to install, inspect only what is needed:
 
-1. Locate `installer/install.ps1`, `tray/build/ZeroIDE-MCP.exe`, `server/server.mjs`, `agent-manifest.json` and the `tools` folder. Missing EXE means a source archive, not an installable release: stop and request `zeroide-mcp.zip` from Releases. Do not build on the owner's PC.
+1. Locate `installer/install.ps1`, `ZeroIDE-MCP.exe` (package root; a source build keeps it in `tray/build/`), `server/server.mjs`, `agent-manifest.json` and the `tools` folder. Missing EXE means a source archive, not an installable release: stop and request `zeroide-mcp.zip` from Releases. Do not build on the owner's PC.
 2. Check `%LOCALAPPDATA%\ZeroIDE-MCP` and the pre-rename folder `%LOCALAPPDATA%\AgentPower`. If either exists, **stop and ask Update / Restore / Delete**. This installer is fresh-only; never remove, overwrite or reinstall an existing installation as a workaround.
 3. Check TCP ports 39011 and 39012. If occupied, identify the conflict without secrets, then stop and ask the owner. Do not kill processes or select a different live port silently.
 

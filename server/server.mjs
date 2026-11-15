@@ -75,7 +75,7 @@ const TRAY_CONTROL_PORT = parseInt(
   10
 );
 const TRAY_CONTROL_SECRET = process.env.TRAY_CONTROL_SECRET || "";
-const SERVER_VERSION = "0.3.0"; // keep equal to server/package.json and agent-manifest.json
+const SERVER_VERSION = "0.4.0"; // keep equal to server/package.json and agent-manifest.json
 
 const AUDIT_MAX_BYTES = 5 * 1024 * 1024; // lowered from 20 MB on 15.08 — at 20 MB rotation never triggered
 const AUDIT_MAX_GENERATIONS = 5;
