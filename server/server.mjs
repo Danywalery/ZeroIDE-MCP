@@ -323,7 +323,7 @@ function clampText(text, maxBytes) {
     omitted +
     tr(" bytes out of ", " байт из ") +
     buf.length +
-    tr(". Showing start and end. Increase maxOutputBytes or use job_output/read_file for the full output] ...\n\n", ". Показаны начало и конец. Увеличь maxOutputBytes или используй job_output/read_file для полного вывода] ...\n\n");
+    tr(". Showing start and end. The full output is kept: page it with job_output({ jobId }) using the job_id below] ...\n\n", ". Показаны начало и конец. Полный вывод сохранён: листай его через job_output({ jobId }) по job_id ниже] ...\n\n");
   return { text: head + marker + tail, truncated: true, totalBytes: buf.length };
 }
 
@@ -482,11 +482,34 @@ function startShell({ command, cwd, timeoutMs }) {
   return { state, child, promise };
 }
 
+// A finished foreground run whose output was clipped is kept as a job, so the
+// omitted middle stays reachable through job_output (paging) instead of being
+// lost. Only clipped runs are kept: the job map holds full buffers in memory.
+function keepAsJob(state) {
+  if (state.jobId) return state.jobId;
+  const jobId = crypto.randomUUID().slice(0, 8);
+  state.jobId = jobId;
+  jobs.set(jobId, {
+    id: jobId,
+    state,
+    promise: Promise.resolve(state),
+    createdAt: Date.now(),
+  });
+  return jobId;
+}
+
 function formatRun(state, maxOut, note) {
   const so = clampText(state.stdout, maxOut);
   const se = clampText(state.stderr, Math.min(maxOut, 32 * 1024));
   const lines = [];
   if (note) lines.push(note);
+  if ((so.truncated || se.truncated) && state.status !== "running") {
+    lines.push("job_id: " + keepAsJob(state));
+    lines.push(
+      tr("full_output: job_output({ jobId, stream, offsetBytes, maxBytes }) pages the complete stdout/stderr",
+         "full_output: job_output({ jobId, stream, offsetBytes, maxBytes }) листает полный stdout/stderr")
+    );
+  }
   lines.push("exit_code: " + state.exitCode);
   lines.push("status: " + state.status);
   if (state.signal) lines.push("signal: " + state.signal);
@@ -1505,6 +1528,18 @@ async function handleTakeScreenshot(args, extra) {
   );
 }
 
+// Sent once in the initialize response: the rules that apply to every tool.
+// Tool descriptions stay specific; cross-cutting guidance lives here so it is
+// not repeated fourteen times.
+const SERVER_INSTRUCTIONS = [
+  "ZeroIDE MCP: hands on the owner's Windows PC, supervised from a tray app. The owner sees every call and may approve, refuse or ignore it.",
+  "- Pass a one-line `note` (in the owner's language) with every mutating call: it is shown on the approval card. A call with no note is harder to approve.",
+  "- A DENIED result is the owner's decision: do not repeat the same call; explain and ask what to do instead.",
+  "- run_command: anything that may take longer than ~20 s goes with wait=<seconds>; then poll job_status (wait up to 50 s) and job_output. Output is capped at 30 KB; a truncated result carries a job_id, and job_output pages the full text.",
+  "- Files: read_file before edit_file; prefer edit_file (exact fragment) to rewriting a file with write_file. Relative paths resolve against the project dir shown in results.",
+  "- Keep the owner informed on multi-step work: task_status for progress, user_message for anything they must know or do, take_screenshot only with a stated reason.",
+].join("\n");
+
 const NOTE_PARAM_SCHEMA = z
   .string()
   .max(200)
@@ -1568,7 +1603,7 @@ function recordToolEvent(tool, args, note, initialStatus = "running") {
 }
 
 function makeServer(ctx) {
-  const server = new McpServer({ name: "zeroide-mcp", version: SERVER_VERSION });
+  const server = new McpServer({ name: "zeroide-mcp", version: SERVER_VERSION }, { instructions: SERVER_INSTRUCTIONS });
   const sessionRef = ctx || { sessionId: "unknown" };
   const reg = (name, config, handler) => {
     const augmentedConfig = {
@@ -1974,7 +2009,7 @@ function makeServer(ctx) {
           : "Run a bash command on this machine as the user who runs the server (that user's rights). ") +
         "Depending on the owner's permission settings a command may wait for approval in the tray or be refused. Default cwd is the project dir. " +
         "Returns exit_code, status, duration_ms and separate stdout/stderr sections. " +
-        "Output is capped at maxOutputBytes (default 100 KB, head+tail kept, truncation is always reported). " +
+        "Output is capped at maxOutputBytes (default 30 KB, head+tail kept, truncation is always reported; a truncated result includes a job_id, and job_output pages the full text). " +
         "Set wait=<seconds> to run long commands in background: you get a job_id immediately and poll it with job_status/job_output. " +
         "Pass a unique requestId to make retries safe (a repeated requestId returns the cached result instead of running again).",
       inputSchema: {
@@ -2170,7 +2205,7 @@ function makeServer(ctx) {
     {
       title: "Job output",
       description:
-        "Fetch output of a background job. Supports paging through large output with offsetBytes/maxBytes, " +
+        "Fetch output of a background job, or of a finished run_command whose result was truncated (it reports a job_id). Supports paging through large output with offsetBytes/maxBytes, " +
         "so nothing is lost even for very long build logs.",
       inputSchema: {
         jobId: z.string(),
