@@ -45,6 +45,10 @@ Watch a real setup and first task with Notion.
 
 https://github.com/user-attachments/assets/d63313c4-a18b-4e34-800a-dda48920bb82
 
+Prefer to do it by hand? Since 0.4.0 the setup wizard walks you through install and connection step by step, no agent needed.
+
+https://github.com/user-attachments/assets/bf236d57-153f-4582-bf66-d85fc6aa6133
+
 1. Open the **Releases** page of this repository and download `zeroide-mcp.zip` (not the "Source code" archives). You can compare its hash with `zeroide-mcp.zip.sha256`:
    ```powershell
    Get-FileHash .\zeroide-mcp.zip -Algorithm SHA256

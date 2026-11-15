@@ -35,6 +35,14 @@ English version: [README.md](README.md)
 
 ## Установка
 
+Установка с AI-агентом и первая задача в Notion (видео на английском):
+
+https://github.com/user-attachments/assets/d63313c4-a18b-4e34-800a-dda48920bb82
+
+Хочешь руками? С версии 0.4.0 мастер настройки проводит через установку и подключение шаг за шагом, агент не нужен:
+
+https://github.com/user-attachments/assets/bf236d57-153f-4582-bf66-d85fc6aa6133
+
 1. Открой страницу **Releases** этого репозитория и скачай `zeroide-mcp.zip` (не архивы «Source code»). Хеш можно сверить с `zeroide-mcp.zip.sha256`:
    ```powershell
    Get-FileHash .\zeroide-mcp.zip -Algorithm SHA256
