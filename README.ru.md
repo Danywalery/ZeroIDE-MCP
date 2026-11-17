@@ -1,10 +1,19 @@
+<div align="center">
+
 # ZeroIDE MCP
 
 **Любой AI-агент может управлять твоим Windows-ПК — из чата в браузере, с другого компьютера или откуда угодно ещё, — но только пока ты это разрешаешь.**
 
-ZeroIDE MCP — [MCP](https://modelcontextprotocol.io)-сервер с приложением в трее Windows. Любой AI-клиент с поддержкой MCP (Claude, ChatGPT, Cursor, Codex, Notion и другие) получает инструменты для команд PowerShell и работы с файлами на этом ПК. По умолчанию сервер выключен: ты включаешь его в трее на нужное время, подтверждаешь важные действия и видишь каждый вызов в журнале аудита.
+[![Скачать](https://img.shields.io/badge/Скачать-zeroide--mcp.zip-c6f82c?style=flat&labelColor=181a20)](https://github.com/Danywalery/ZeroIDE-MCP/releases/latest/download/zeroide-mcp.zip)
+[![Сайт](https://img.shields.io/badge/Сайт-ZeroIDE_MCP-7c65ff?style=flat&labelColor=181a20)](https://danywalery.github.io/zeroide-mcp-site/)
+[![Демо](https://img.shields.io/badge/Демо-в_браузере-22272e?style=flat&labelColor=181a20)](https://danywalery.github.io/zeroide-mcp-site/#live)
+[![Релиз](https://img.shields.io/github/v/release/Danywalery/ZeroIDE-MCP?style=flat&label=релиз&labelColor=181a20&color=30363d)](https://github.com/Danywalery/ZeroIDE-MCP/releases/latest)
 
-English version: [README.md](README.md)
+[Установка](#установка) · [Подключения](CONNECTIONS.md) · [Безопасность](SECURITY.md) · [English](README.md)
+
+</div>
+
+ZeroIDE MCP — [MCP](https://modelcontextprotocol.io)-сервер с приложением в трее Windows. Любой AI-клиент с поддержкой MCP (Claude, ChatGPT, Cursor, Codex, Notion и другие) получает инструменты для команд PowerShell и работы с файлами на этом ПК. По умолчанию сервер выключен: ты включаешь его в трее на нужное время, подтверждаешь важные действия и видишь каждый вызов в журнале аудита.
 
 > **Статус: 0.4.0.** Ручная установка с пошаговым мастером, агент не нужен. Автотесты проходят в CI; ручной путь проверен на чистом ПК (установка, ngrok) и на ПК разработчика (Tailscale, удаление). Не все AI-клиенты протестированы. См. [Ограничения](#ограничения).
 

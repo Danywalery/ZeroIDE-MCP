@@ -1,10 +1,19 @@
+<div align="center">
+
 # ZeroIDE MCP
 
 **Let any AI agent control your Windows PC — from a chat in the browser, from another computer or from anywhere else — but only while you allow it.**
 
-ZeroIDE MCP is an [MCP](https://modelcontextprotocol.io) server with a Windows tray app. Any AI client that supports MCP (Claude, ChatGPT, Cursor, Codex, Notion and others) gets tools to run PowerShell commands and work with files on this PC. The server is off by default: you switch it on in the tray for as long as you need it, approve sensitive actions and see every call in the audit log.
+[![Download](https://img.shields.io/badge/Download-zeroide--mcp.zip-c6f82c?style=flat&labelColor=181a20)](https://github.com/Danywalery/ZeroIDE-MCP/releases/latest/download/zeroide-mcp.zip)
+[![Website](https://img.shields.io/badge/Website-ZeroIDE_MCP-7c65ff?style=flat&labelColor=181a20)](https://danywalery.github.io/zeroide-mcp-site/)
+[![Live Demo](https://img.shields.io/badge/Live_Demo-try_in_browser-22272e?style=flat&labelColor=181a20)](https://danywalery.github.io/zeroide-mcp-site/#live)
+[![Release](https://img.shields.io/github/v/release/Danywalery/ZeroIDE-MCP?style=flat&label=release&labelColor=181a20&color=30363d)](https://github.com/Danywalery/ZeroIDE-MCP/releases/latest)
 
-Русская версия: [README.ru.md](README.ru.md)
+[Install](#install) · [Connections](CONNECTIONS.md) · [Security](SECURITY.md) · [Русская версия](README.ru.md)
+
+</div>
+
+ZeroIDE MCP is an [MCP](https://modelcontextprotocol.io) server with a Windows tray app. Any AI client that supports MCP (Claude, ChatGPT, Cursor, Codex, Notion and others) gets tools to run PowerShell commands and work with files on this PC. The server is off by default: you switch it on in the tray for as long as you need it, approve sensitive actions and see every call in the audit log.
 
 > **Status: 0.4.0.** Manual installation with a step-by-step wizard, no agent needed. The automated suites pass in CI; the manual path was tested on a clean PC (install, ngrok) and on a development PC (Tailscale, uninstall). Not all AI clients have been tested. See [Known limits](#known-limits).
 
