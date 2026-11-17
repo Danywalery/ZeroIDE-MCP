@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="112" height="36" viewBox="0 0 112 36" role="img" aria-label="Releases">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#191d26"/>
+      <stop offset="100%" stop-color="#101218"/>
+    </linearGradient>
+  </defs>
+  <rect x="0.75" y="0.75" width="110.5" height="34.5" rx="17.25" fill="url(#bg)" stroke="#323846" stroke-width="1.1"/>
+  <g transform="translate(12 10)" fill="none" stroke="#9ea6b8" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M2.5 3.5a1 1 0 0 1 1-1h3.586a1 1 0 0 1 .707.293l6.414 6.414a1.5 1.5 0 0 1 0 2.121l-3.879 3.879a1.5 1.5 0 0 1-2.121 0L2.793 8.793A1 1 0 0 1 2.5 8.086V3.5z"/>
+    <circle cx="5.75" cy="5.75" r="1" fill="#c6f82c" stroke="none"/>
+  </g>
+  <text x="65.5" y="22.8" text-anchor="middle" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif" font-size="13.5" font-weight="600" letter-spacing="-0.1" fill="#e6e9f0">Releases</text>
+</svg>

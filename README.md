@@ -4,12 +4,11 @@
 
 **Let any AI agent control your Windows PC — from a chat in the browser, from another computer or from anywhere else — but only while you allow it.**
 
-[![Download](https://img.shields.io/badge/Download-zeroide--mcp.zip-c6f82c?style=flat&labelColor=181a20)](https://github.com/Danywalery/ZeroIDE-MCP/releases/latest/download/zeroide-mcp.zip)
-[![Website](https://img.shields.io/badge/Website-ZeroIDE_MCP-7c65ff?style=flat&labelColor=181a20)](https://danywalery.github.io/zeroide-mcp-site/)
-[![Live Demo](https://img.shields.io/badge/Live_Demo-try_in_browser-22272e?style=flat&labelColor=181a20)](https://danywalery.github.io/zeroide-mcp-site/#live)
-[![Release](https://img.shields.io/github/v/release/Danywalery/ZeroIDE-MCP?style=flat&label=release&labelColor=181a20&color=30363d)](https://github.com/Danywalery/ZeroIDE-MCP/releases/latest)
+<p align="center">
+  <a href="https://github.com/Danywalery/ZeroIDE-MCP/releases/latest/download/zeroide-mcp.zip"><img src="docs/media/buttons/download-en.svg" height="36" alt="Download zeroide-mcp.zip"></a>&nbsp;&nbsp;<a href="https://danywalery.github.io/zeroide-mcp-site/"><img src="docs/media/buttons/website-en.svg" height="36" alt="ZeroIDE MCP Website"></a>&nbsp;&nbsp;<a href="https://danywalery.github.io/zeroide-mcp-site/#live"><img src="docs/media/buttons/demo-en.svg" height="36" alt="Live Demo in Browser"></a>&nbsp;&nbsp;<a href="https://github.com/Danywalery/ZeroIDE-MCP/releases/latest"><img src="docs/media/buttons/release-en.svg" height="36" alt="Releases"></a>
+</p>
 
-[Install](#install) · [Connections](CONNECTIONS.md) · [Security](SECURITY.md) · [Русская версия](README.ru.md)
+[v0.4.0](https://github.com/Danywalery/ZeroIDE-MCP/releases/latest) · [Install](#install) · [Connections](CONNECTIONS.md) · [Security](SECURITY.md) · [Русская версия](README.ru.md)
 
 </div>
 
