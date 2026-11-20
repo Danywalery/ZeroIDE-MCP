@@ -30,7 +30,7 @@ https://github.com/user-attachments/assets/525d61c6-c8bc-4902-a694-90eb2ba04891
 
 Each PC keeps its own approvals, tokens and audit log: a token for one PC does not work on another.
 
-![MCP tools: commands, files, screen, messages to you, records](docs/media/tools.png)
+![19 MCP tools: commands, files, screen, images, messages, PC info, records](docs/media/tools.png)
 
 ## Features
 
