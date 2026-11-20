@@ -5,16 +5,16 @@
 **Let any AI agent control your Windows PC — from a chat in the browser, from another computer or from anywhere else — but only while you allow it.**
 
 <p align="center">
-  <a href="https://github.com/Danywalery/ZeroIDE-MCP/releases/latest/download/zeroide-mcp.zip"><img src="docs/media/buttons/download-en.svg" height="36" alt="Download zeroide-mcp.zip"></a>&nbsp;&nbsp;<a href="https://danywalery.github.io/zeroide-mcp-site/"><img src="docs/media/buttons/website-en.svg" height="36" alt="ZeroIDE MCP Website"></a>&nbsp;&nbsp;<a href="https://danywalery.github.io/zeroide-mcp-site/#live"><img src="docs/media/buttons/demo-en.svg" height="36" alt="Live Demo in Browser"></a>&nbsp;&nbsp;<a href="https://github.com/Danywalery/ZeroIDE-MCP/releases/latest"><img src="docs/media/buttons/release-en.svg" height="36" alt="Releases"></a>
+  <a href="https://github.com/Danywalery/ZeroIDE-MCP/releases/latest/download/zeroide-mcp.zip"><img src="docs/media/buttons/download-en.svg" height="36" alt="Download zeroide-mcp.zip"></a>&nbsp;&nbsp;<a href="https://danywalery.github.io/zeroide-mcp-site/"><img src="docs/media/buttons/website-en.svg" height="36" alt="ZeroIDE MCP Website"></a>&nbsp;&nbsp;<a href="https://danywalery.github.io/zeroide-mcp-site/#live"><img src="docs/media/buttons/demo-en.svg" height="36" alt="Live Demo in Browser"></a>&nbsp;&nbsp;<a href="https://github.com/Danywalery/ZeroIDE-MCP/releases/latest"><img src="docs/media/buttons/release-en.svg" height="36" alt="Releases"></a>&nbsp;&nbsp;<a href="https://t.me/danywalery"><img src="docs/media/buttons/telegram.svg" height="36" alt="Telegram @danywalery"></a>
 </p>
 
-[v0.4.0](https://github.com/Danywalery/ZeroIDE-MCP/releases/latest) · [Install](#install) · [Connections](CONNECTIONS.md) · [Security](SECURITY.md) · [Русская версия](README.ru.md)
+[v0.5.0](https://github.com/Danywalery/ZeroIDE-MCP/releases/latest) · [Install](#install) · [Connections](CONNECTIONS.md) · [Security](SECURITY.md) · [Telegram @danywalery](https://t.me/danywalery) · [Русская версия](README.ru.md)
 
 </div>
 
 ZeroIDE MCP is an [MCP](https://modelcontextprotocol.io) server with a Windows tray app. Any AI client that supports MCP (Claude, ChatGPT, Cursor, Codex, Notion and others) gets tools to run PowerShell commands and work with files on this PC. The server is off by default: you switch it on in the tray for as long as you need it, approve sensitive actions and see every call in the audit log.
 
-> **Status: 0.4.0.** Manual installation with a step-by-step wizard, no agent needed. The automated suites pass in CI; the manual path was tested on a clean PC (install, ngrok) and on a development PC (Tailscale, uninstall). Not all AI clients have been tested. See [Known limits](#known-limits).
+> **Status: 0.5.0.** Safer agent work: risk cards with a diff, self-protection and undo of agent changes in **Settings → Changes**. Manual installation with a step-by-step wizard, no agent needed. The automated suites pass in CI; the manual path was tested on a clean PC (install, ngrok) and on a development PC (Tailscale, uninstall). Not all AI clients have been tested. See [Known limits](#known-limits).
 
 ## Demo
 
@@ -30,13 +30,16 @@ https://github.com/user-attachments/assets/525d61c6-c8bc-4902-a694-90eb2ba04891
 
 Each PC keeps its own approvals, tokens and audit log: a token for one PC does not work on another.
 
-![14 MCP tools: commands, files, screen, messages to you, records](docs/media/tools.png)
+![MCP tools: commands, files, screen, messages to you, records](docs/media/tools.png)
 
 ## Features
 
-- **14 MCP tools:** PowerShell commands (including background jobs and their output), files (read, write, edit, list, search), task status, messages to the owner, screenshots, the audit log and an agent journal.
+- **19 MCP tools:** PowerShell commands (including background jobs and their output), files (read, write, edit, list, search, copy, move, delete), images, system info, task status, messages to the owner with an **Open** button, screenshots, the audit log and an agent journal.
 - **Off by default.** The server listens on 127.0.0.1 only and runs only while it is switched on in the tray. Switching it off or exiting the tray closes access through the app.
 - **Approvals.** By default reading is allowed, while writing or editing files and running commands wait for your confirmation in the tray.
+- **Risk cards.** Every command and file change is rated low, medium, high or critical; the approval card explains the risk in plain words and shows the diff of a file change. A critical call defaults to **Deny** and can only be allowed once.
+- **Undo of agent changes.** Before an agent overwrites, edits or deletes a file, the previous version is kept in ZeroIDE history for 30 days. **Settings → Changes** (or **Agent changes (undo)…** in the tray menu) lists the changes with **Undo** and **Compare**.
+- **Self-protection.** Agents cannot read ZeroIDE's own tokens or change its settings, journals and history through MCP tools.
 - **Access control.** OAuth sign-in that you approve in the tray, or named tokens with a scope (read, read-write or full), an optional folder they cannot leave, an expiry date and a request limit. Tokens can be rotated and revoked.
 - **Remote access of your choice.** Local only, a private network such as Tailscale, ngrok, Cloudflare Tunnel with your own domain, or your own SSH server. Accounts and domains are yours; the project runs no gateway of its own. See [CONNECTIONS.md](CONNECTIONS.md).
 - **Audit.** Every tool call is logged, with secrets masked.
@@ -63,7 +66,7 @@ https://github.com/user-attachments/assets/bf236d57-153f-4582-bf66-d85fc6aa6133
    ```powershell
    Get-FileHash .\zeroide-mcp.zip -Algorithm SHA256
    ```
-2. Extract the archive and start **ZeroIDE-MCP.exe** from the extracted folder. The setup wizard opens: it explains what the app does and offers two ways in.
+2. Extract the archive (it unpacks into a single `zeroide-mcp` folder) and start **ZeroIDE-MCP.exe** from that folder. The setup wizard opens: it explains what the app does and offers two ways in.
    - **Manually, with guidance.** The wizard installs everything, then asks which AI you want to connect (an agent on this PC, ChatGPT, Claude, Notion, another computer) and walks you through the connection. For a web chat it recommends ngrok and does the technical part; you only sign in to ngrok, paste the key into the app's window and approve the launch. For another computer of yours it sets up Tailscale (installs it if needed, waits for your sign-in, publishes the server inside your tailnet with Tailscale Serve). With your own domain it runs cloudflared for a Cloudflare Tunnel you create in Zero Trust. An address of your own goes in as "I already have an address".
    - **With an AI agent on this PC.** The wizard gives you a task to paste into Claude Code, Cursor, Codex or another agent; the agent follows `AGENT_INSTALL.md` from the archive.
    If you prefer the command line, the same installer runs with `powershell -NoProfile -ExecutionPolicy Bypass -File .\installer\install.ps1` (add `-Update` to update an existing installation).

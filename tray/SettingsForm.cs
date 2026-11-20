@@ -39,6 +39,8 @@ internal sealed partial class SettingsForm : Form
     private string _hoveredZoneId = "";
     private readonly ToolTip _toolTip = new();
     private string? _lastHoveredTip;
+    private string _tgFeedback = "";
+    internal Func<bool>? ConfirmDisableCriticalForTests = null;
 
     private List<ActiveGrantItem> _activeGrants = new();
     private List<AuditRowItem> _auditItems = new();
@@ -97,6 +99,7 @@ internal sealed partial class SettingsForm : Form
         new("notifications", "Notifications", "Уведомления", Theme.Danger, "bell"),
         new("connection", "Connection", "Подключение", Theme.Info, "link"),
         new("audit", "Journal and audit", "Журнал и аудит", Theme.Accent, "list"),
+        new("changes", "Changes", "Изменения", Theme.Info, "history"),
         new("screenshots", "Screenshots", "Скриншоты", Theme.Info, "image"),
         new("uninstall", "Uninstall", "Удаление", Theme.Danger, "trash"),
         new("about", "About", "О программе", Theme.TextTertiary, "info"),
@@ -109,6 +112,7 @@ internal sealed partial class SettingsForm : Form
         _activeSection = string.IsNullOrWhiteSpace(initialSection) ? "tools" : initialSection;
 
         Text = I18n.Format("{0} — Settings", "{0} — Настройки", Theme.ProductName);
+        Theme.ApplyLogo(this);
         FormBorderStyle = FormBorderStyle.None;
         Size = new Size(1180, 800);
         MinimumSize = new Size(1000, 680);
@@ -132,6 +136,10 @@ internal sealed partial class SettingsForm : Form
                 LoadAuditItems();
                 Invalidate();
             }
+            else if (_activeSection == "changes")
+            {
+                LoadChanges();
+            }
             else if (_activeSection == "access" || _activeSection == "general" || _activeSection == "home" || _activeSection == "connection")
             {
                 Invalidate();
@@ -139,6 +147,7 @@ internal sealed partial class SettingsForm : Form
         };
         _liveTimer.Start();
         FormClosed += (_, _) => _liveTimer.Stop();
+        Shown += (_, _) => { if (_activeSection == "changes") LoadChanges(force: true); };
     }
 
     protected override void OnHandleCreated(EventArgs e)
@@ -159,6 +168,7 @@ internal sealed partial class SettingsForm : Form
         _scrollY = 0;
         if (section == "audit") LoadAuditItems();
         else if (section == "approvals") _ = RefreshGrantsAsync();
+        else if (section == "changes") LoadChanges(force: true);
         if (WindowState == FormWindowState.Minimized)
             WindowState = FormWindowState.Normal;
         Activate();
@@ -325,11 +335,8 @@ internal sealed partial class SettingsForm : Form
         bool online = _ctx.CurrentState == "on";
         bool starting = _ctx.CurrentState == "starting";
         Color stateColor = online ? ColGreen : (starting ? ColOrange : Theme.TextTertiary);
-        // The same hexagonal brand mark as the approved reference.
-        PointF[] outer = { new(28, 14), new(39, 20.5f), new(39, 33.5f), new(28, 40), new(17, 33.5f), new(17, 20.5f) };
-        using (var fill = new LinearGradientBrush(new Rectangle(17, 14, 22, 26), Theme.AccentHover, Theme.AccentPressed, 45f)) g.FillPolygon(fill, outer);
-        PointF[] inner = { new(28, 21), new(33, 24), new(33, 30), new(28, 33), new(23, 30), new(23, 24) };
-        using (var pen = new Pen(Color.White, 1.8f) { LineJoin = LineJoin.Round }) g.DrawPolygon(pen, inner);
+        // The ZeroIDE logo (assets/zeroide-logo.svg) in place of the earlier hexagon mark.
+        Theme.DrawLogo(g, new RectangleF(14, 13, 28, 28));
         Theme.DrawText(g, Theme.ProductName, UiFont(10.5f, true), ColTextPrimary, new RectangleF(50, 15, 150, 25));
         string connection = online ? I18n.T("Connected", "Подключено") : (starting ? I18n.T("Starting", "Запуск") : I18n.T("Offline", "Отключено"));
         float chipW = Theme.MeasureChipOutlinedWidth(g, connection, true, UiSmallStrong);
@@ -357,7 +364,11 @@ internal sealed partial class SettingsForm : Form
             }
             else if (hover) Theme.FillRound(g, row, 10, Theme.HoverOverlay);
             Theme.DrawIcon(g, GlyphToIcon(item.IconKind), new RectangleF(24, y + 11, 18, 18), selected ? Theme.AccentText : Theme.TextTertiary, 1.7f);
-            Theme.DrawText(g, item.Title, UiFont(10.125f, selected), selected ? ColTextPrimary : ColTextSecondary, new RectangleF(54, y, SidebarWidth - 72, 40));
+            bool showUpdateDot = item.Id == "about" && _ctx.Updater.State.HasUpdate;
+            float labelW = showUpdateDot ? SidebarWidth - 96 : SidebarWidth - 72;
+            Theme.DrawText(g, item.Title, UiFont(10.125f, selected), selected ? ColTextPrimary : ColTextSecondary, new RectangleF(54, y, labelW, 40));
+            if (showUpdateDot)
+                Theme.DrawStatusDot(g, new PointF(SidebarWidth - 26f, y + 20f), 4f, ColBlue, halo: true);
             string id = item.Id;
             _hitZones.Add(new(row, "nav_" + id, () => NavigateToSection(id)));
             y += 44f;
@@ -416,6 +427,7 @@ internal sealed partial class SettingsForm : Form
         "link" => IconKind.Link,
         "image" => IconKind.Image,
         "trash" => IconKind.Trash,
+        "history" => IconKind.History,
         _ => IconKind.About,
     };
 
@@ -457,6 +469,11 @@ internal sealed partial class SettingsForm : Form
         int firstContentZone = _hitZones.Count;
         float y = clipTop + 6f - _scrollY;
 
+        if (_activeSection != "about" && _ctx.Updater.State.ShowBanner)
+        {
+            y = DrawUpdateAvailableBanner(g, contentX, contentW, y);
+        }
+
         switch (_activeSection)
         {
             case "home":
@@ -482,6 +499,9 @@ internal sealed partial class SettingsForm : Form
                 break;
             case "audit":
                 y = DrawAuditContent(g, contentX, contentW, y);
+                break;
+            case "changes":
+                y = DrawChangesContent(g, contentX, contentW, y);
                 break;
             case "screenshots":
                 y = DrawScreenshotsContent(g, contentX, contentW, y);
@@ -649,7 +669,7 @@ internal sealed partial class SettingsForm : Form
         float popY = DrawGroupTitle(g, x, y, I18n.T("POPULAR SETTINGS", "ПОПУЛЯРНЫЕ НАСТРОЙКИ"));
         DrawGroupTitle(g, rx, y, I18n.T("CURRENT TASK", "ТЕКУЩАЯ ЗАДАЧА"));
 
-        bool rfOn = _perms.RedFlags?.Enabled != false && _perms.RedFlags?.ElevateToAsk != false;
+        bool rfOn = PermissionsStore.IsHighRiskFilterEnabled(_perms);
         bool notifOn = _ctx.Config.NotificationsEnabled;
         bool shotsOn = _ctx.Config.SaveScreenshots;
         bool autostart = _ctx.GetAutostartFromUi();
@@ -769,7 +789,7 @@ internal sealed partial class SettingsForm : Form
         // ---- Parameters (kept from the previous home page)
         y = Math.Max(leftBottom, rightBottom) + 24f;
         y = DrawGroupTitle(g, x, y, I18n.T("PARAMETERS", "ПАРАМЕТРЫ"));
-        string menu = (_ctx.Config.TrayMenuMode ?? "").ToLowerInvariant() switch { "panel" => I18n.T("Panel", "Панель"), "mini" => I18n.T("Mini", "Мини"), _ => I18n.T("Classic", "Классика") };
+        string menu = (_ctx.Config.TrayMenuMode ?? "").ToLowerInvariant() switch { "classic" => I18n.T("Classic", "Классика"), "mini" => I18n.T("Mini", "Мини"), _ => I18n.T("Panel", "Панель") };
         var links = new (string Label, string Value, IconKind Icon, Color Tint, string Section, bool Mono)[] {
             (I18n.T("Project working folder", "Рабочая папка проекта"), _ctx.Config.ProjectDir ?? "", IconKind.Folder, ColBlue, "general", true),
             (I18n.T("MCP port", "Порт MCP"), $"127.0.0.1:{_ctx.Config.Port}", IconKind.Connection, Theme.Info, "connection", true),
@@ -866,7 +886,7 @@ internal sealed partial class SettingsForm : Form
 
         // Row 2: Tray Menu Mode ("classic" | "panel" | "mini")
         y += rowH;
-        string curMenuMode = string.IsNullOrEmpty(_ctx.Config.TrayMenuMode) ? "classic" : _ctx.Config.TrayMenuMode.ToLowerInvariant();
+        string curMenuMode = string.IsNullOrEmpty(_ctx.Config.TrayMenuMode) ? "panel" : _ctx.Config.TrayMenuMode.ToLowerInvariant();
         DrawSettingRow(g, x, y, w - 310f, rowH, ColPurple, "list", I18n.T("Tray menu style", "Вид меню трея"), I18n.T("Classic Windows menu, control panel, or compact strip", "Классическое меню Windows, панель управления или компактная полоска"), drawDivider: true);
         DrawSegmentedBar(
             g,
@@ -1388,7 +1408,16 @@ internal sealed partial class SettingsForm : Form
         int totalTools = PermissionsStore.AllTools.Count;
         int allowedTools = PermissionsStore.AllTools.Count(t => PermissionsStore.GetToolMode(_perms, t.Name) != "deny");
         int askTools = PermissionsStore.AllTools.Count(t => PermissionsStore.GetToolMode(_perms, t.Name) == "ask");
-        bool rfTop = _perms.RedFlags?.Enabled != false && _perms.RedFlags?.ElevateToAsk != false;
+        bool rfTop = PermissionsStore.IsHighRiskFilterEnabled(_perms);
+        bool critTop = PermissionsStore.IsCriticalGuardEnabled(_perms);
+        Color secCol = (rfTop && critTop) ? ColGreen : (!rfTop && !critTop ? ColRed : ColOrange);
+        string secCaption = (rfTop, critTop) switch
+        {
+            (true, true) => I18n.T("High + Critical protection on", "Защита High + Critical включена"),
+            (false, true) => I18n.T("High off · Critical guard on", "High выкл. · Critical под защитой"),
+            (true, false) => I18n.T("High on · Critical grants allowed", "High вкл. · Critical без блока"),
+            (false, false) => I18n.T("Risk protection off (full autonomy)", "Проверка риска выкл. (автономия)"),
+        };
         string insightPreset = PermissionsStore.DetectActivePreset(_perms) switch
         {
             "cautious" => I18n.T("Cautious", "Осторожный"),
@@ -1397,7 +1426,7 @@ internal sealed partial class SettingsForm : Form
             _ => I18n.T("Custom", "Свой набор"),
         };
         y = DrawInsightRow(g, x, w, y,
-            new InsightCard(IconKind.ShieldCheck, rfTop ? ColGreen : ColOrange, I18n.T("Security", "Безопасность"), I18n.Format("{0} with approval", "{0} с подтверждением", askTools), rfTop ? I18n.T("Red-Flag filter is on", "Фильтр Red-Flag включён") : I18n.T("Red-Flag filter is off", "Фильтр Red-Flag выключен")),
+            new InsightCard(IconKind.ShieldCheck, secCol, I18n.T("Security", "Безопасность"), I18n.Format("{0} with approval", "{0} с подтверждением", askTools), secCaption),
             new InsightCard(IconKind.User, ColBlue, I18n.T("Available to agents", "Агентам доступно"), I18n.Format("{0} of {1} tools", "{0} из {1} инструментов", allowedTools, totalTools), I18n.Format("Profile: {0}", "Профиль: {0}", insightPreset)),
             new InsightCard(IconKind.Lightbulb, ColOrange, I18n.T("Tip", "Совет"), I18n.T("Grant only the minimum permissions needed — it keeps the computer safer.", "Используйте минимально необходимые права для большей безопасности."), null, Tip: true));
         y = DrawConfinementCard(g, x, w, y, "tools");
@@ -1480,7 +1509,7 @@ internal sealed partial class SettingsForm : Form
 
             y = DrawGroupTitle(g, x, y, catTitle.ToUpperInvariant());
 
-            int extraRows = catKey == "Execution" ? 1 : 0; // Red-flag toggle row inside Execution
+            int extraRows = catKey == "Execution" ? 2 : 0; // High/Red-Flag and Critical risk toggles inside Execution
             float rowH = RowH;
             var groupRect = new RectangleF(x, y, w, (tools.Count + extraRows) * rowH);
             DrawCardSurface(g, groupRect);
@@ -1517,6 +1546,8 @@ internal sealed partial class SettingsForm : Form
                             if (res != DialogResult.Yes) return;
                         }
                         PermissionsStore.SetToolMode(_perms, tool.Name, pickedMode);
+                        if (tool.Name == "await_owner" && pickedMode == "deny" && _ctx.HoldAfterTask)
+                            _ = _ctx.SetHoldAfterTaskAsync(false);
                         Invalidate();
                     });
 
@@ -1525,7 +1556,24 @@ internal sealed partial class SettingsForm : Form
 
             if (catKey == "Execution")
             {
-                bool rfOn = _perms.RedFlags?.Enabled != false && _perms.RedFlags?.ElevateToAsk != false;
+                bool rfOn = PermissionsStore.IsHighRiskFilterEnabled(_perms);
+                DrawSettingRow(
+                    g,
+                    x,
+                    y,
+                    w - 80f,
+                    rowH,
+                    ColOrange,
+                    "warning",
+                    I18n.T("High-risk & Red-Flag protection", "Фильтр опасных команд (Red-Flag / High)"),
+                    I18n.T("Ask before destructive commands and high-risk calls, even if allowed", "Спрашивать перед деструктивными командами и high-риском, даже если инструмент разрешён"),
+                    drawDivider: true);
+
+                DrawIosToggle(g, x + w - 62f, y + 20f, rfOn, "toggle_redflags", () =>
+                { ToggleRedFlags(); Invalidate(); });
+                y += rowH;
+
+                bool critOn = PermissionsStore.IsCriticalGuardEnabled(_perms);
                 DrawSettingRow(
                     g,
                     x,
@@ -1533,13 +1581,13 @@ internal sealed partial class SettingsForm : Form
                     w - 80f,
                     rowH,
                     ColRed,
-                    "warning",
-                    I18n.T("Dangerous command filter (Red-Flag)", "Фильтр опасных команд (Red-Flag)"),
-                    I18n.T("Always ask for approval for destructive commands (even if run_command is allowed)", "Всегда спрашивать подтверждение для деструктивных команд (даже если run_command разрешён)"),
+                    "shield",
+                    I18n.T("Critical action protection (Critical)", "Защита от критичных действий (Critical)"),
+                    I18n.T("Ask one-time approval for critical calls; disable both toggles for full autonomy", "Разовое подтверждение на критичный риск; выключите оба тумблера для полной автономии"),
                     drawDivider: false);
 
-                DrawIosToggle(g, x + w - 62f, y + 20f, rfOn, "toggle_redflags", () =>
-                { ToggleRedFlags(); Invalidate(); });
+                DrawIosToggle(g, x + w - 62f, y + 20f, critOn, "toggle_critical_guard", () =>
+                { ToggleCriticalGuard(); Invalidate(); });
                 y += rowH;
             }
 
@@ -1843,6 +1891,92 @@ internal sealed partial class SettingsForm : Form
             Invalidate();
         });
 
+        y += rowH + 22f;
+        y = DrawGroupTitle(g, x, y, I18n.T("TELEGRAM ALERTS (ONE-WAY)", "УВЕДОМЛЕНИЯ В TELEGRAM (ОДНОСТОРОННИЕ)"));
+
+        var tg = _ctx.Telegram.Config;
+        int tgRows = tg.IsConfigured ? 4 : 1;
+        var tgCard = new RectangleF(x, y, w, rowH * tgRows);
+        DrawCardSurface(g, tgCard);
+
+        string tgSub;
+        if (!tg.IsConfigured)
+        {
+            tgSub = I18n.T("Send alerts to your Telegram when tasks finish, agents message you or approval is needed", "Присылать алерты в Telegram по готовности задач, сообщениям агента и подтверждениям");
+        }
+        else
+        {
+            string who = string.IsNullOrWhiteSpace(tg.ChatLabel) ? $"ID {tg.ChatId}" : $"{tg.ChatLabel} (ID {tg.ChatId})";
+            tgSub = !string.IsNullOrEmpty(_tgFeedback)
+                ? _tgFeedback
+                : (tg.Enabled
+                    ? I18n.Format("Connected: {0} · token protected from MCP agents", "Подключено: {0} · токен защищён от агентов MCP", who)
+                    : I18n.Format("Paused ({0}) · flip the toggle to resume", "На паузе ({0}) · включи тумблер для отправки", who));
+        }
+
+        float tgRightReserve = tg.IsConfigured ? 310f : 170f;
+        DrawSettingRow(g, x, y, w - tgRightReserve, rowH, Theme.Info, "globe", I18n.T("Telegram bot alerts", "Алерты через Telegram-бота"), tgSub, drawDivider: tg.IsConfigured);
+
+        if (tg.IsConfigured)
+        {
+            DrawIosToggle(g, x + w - 62f, y + 20f, tg.Enabled, "tg_enabled_toggle", () =>
+            {
+                tg.Enabled = !tg.Enabled;
+                _tgFeedback = "";
+                _ctx.Telegram.UpdateConfig(tg);
+                Invalidate();
+            });
+            float rx = DrawPillButtonRight(g, x + w - 76f, y + 14f, I18n.T("Configure…", "Настроить…"), ColPillIdle, ColTextPrimary, "tg_cfg_btn", () =>
+            {
+                _tgFeedback = "";
+                _ctx.OpenTelegramSettingsFromUi(this);
+                Invalidate();
+            });
+            DrawPillButtonRight(g, rx - 8f, y + 14f, I18n.T("Test", "Тест"), ColBlue, Color.White, "tg_test_btn", async () =>
+            {
+                _tgFeedback = I18n.T("Sending test message…", "Отправляю тест…");
+                Invalidate();
+                var res = await _ctx.Telegram.SendTestAsync(tg.BotToken, tg.ChatId);
+                if (!IsDisposed) { _tgFeedback = res.Detail; Invalidate(); }
+            });
+
+            y += rowH;
+            DrawSettingRow(g, x, y, w - 80f, rowH, ColGreen, "check", I18n.T("Task completion", "Завершение задачи"), I18n.T("Alert when an agent marks its current task as done", "Уведомлять, когда агент завершил текущую задачу"), drawDivider: true);
+            DrawIosToggle(g, x + w - 62f, y + 20f, tg.NotifyTaskDone, "tg_task_done", () =>
+            {
+                tg.NotifyTaskDone = !tg.NotifyTaskDone;
+                _ctx.Telegram.UpdateConfig(tg);
+                Invalidate();
+            });
+
+            y += rowH;
+            DrawSettingRow(g, x, y, w - 80f, rowH, ColBlue, "bell", I18n.T("Agent messages", "Сообщения агента"), I18n.T("Forward messages sent via user_message (status, requests, warnings)", "Дублировать сообщения агента из user_message (статусы, запросы, предупреждения)"), drawDivider: true);
+            DrawIosToggle(g, x + w - 62f, y + 20f, tg.NotifyAgentMessages, "tg_agent_msg", () =>
+            {
+                tg.NotifyAgentMessages = !tg.NotifyAgentMessages;
+                _ctx.Telegram.UpdateConfig(tg);
+                Invalidate();
+            });
+
+            y += rowH;
+            DrawSettingRow(g, x, y, w - 80f, rowH, ColOrange, "shield", I18n.T("Approval requests", "Запросы подтверждения"), I18n.T("Alert when a risk card is waiting for your click on this PC", "Предупреждать, когда на ПК появилась карточка риска и ждёт вашего ответа"), drawDivider: false);
+            DrawIosToggle(g, x + w - 62f, y + 20f, tg.NotifyApprovals, "tg_approvals", () =>
+            {
+                tg.NotifyApprovals = !tg.NotifyApprovals;
+                _ctx.Telegram.UpdateConfig(tg);
+                Invalidate();
+            });
+        }
+        else
+        {
+            DrawPillButtonRight(g, x + w - 16f, y + 14f, I18n.T("Configure…", "Настроить…"), ColBlue, Color.White, "tg_cfg_btn", () =>
+            {
+                _tgFeedback = "";
+                _ctx.OpenTelegramSettingsFromUi(this);
+                Invalidate();
+            });
+        }
+
         return y + rowH + 16f;
     }
 
@@ -1917,6 +2051,84 @@ internal sealed partial class SettingsForm : Form
         return y + 16f;
     }
 
+    // ============================================================ UPDATE BANNER (visible across Settings when an update is available)
+    private float DrawUpdateAvailableBanner(Graphics g, float x, float w, float y)
+    {
+        var st = _ctx.Updater.State;
+        var rel = st.Latest;
+        if (rel == null) return y;
+
+        bool busy = st.Stage is UpdateStage.Downloading or UpdateStage.Installing;
+        bool waiting = st.Stage == UpdateStage.WaitingForServerOff;
+        Color tint = waiting ? ColOrange : ColBlue;
+        const float h = 64f;
+        var card = new RectangleF(x, y, w, h);
+
+        using (var path = Theme.RoundRect(card, Theme.RadiusCard))
+        {
+            using (var bg = new SolidBrush(Theme.Surface)) g.FillPath(bg, path);
+            var sv = g.Save();
+            g.SetClip(path, CombineMode.Intersect);
+            DrawRadialWash(g, new PointF(card.X, card.Y), w * 0.45f, h * 2.2f, Theme.WithAlpha(tint, 44));
+            if (busy && st.ProgressPercent > 0)
+            {
+                float pw = Math.Clamp(st.ProgressPercent / 100f, 0.04f, 1f) * card.Width;
+                using var pb = new SolidBrush(tint);
+                g.FillRectangle(pb, card.X, card.Bottom - 3f, pw, 3f);
+            }
+            g.Restore(sv);
+        }
+        Theme.StrokeRound(g, card, Theme.RadiusCard, Theme.WithAlpha(tint, 110));
+
+        var tile = new RectangleF(x + 14f, y + (h - 36f) / 2f, 36f, 36f);
+        DrawTintTile(g, tile, waiting ? IconKind.Clock : IconKind.Refresh, tint, 10f, 18f);
+
+        // Right-side controls: dismiss (×), What's new, Update now
+        float right = x + w - 14f;
+        float btnY = y + (h - 32f) / 2f;
+
+        var dismiss = new RectangleF(right - 28f, btnY + 2f, 28f, 28f);
+        bool disHov = dismiss.Contains(_mousePos);
+        if (disHov) Theme.FillRound(g, dismiss, 7f, Theme.HoverOverlay);
+        Theme.DrawIcon(g, IconKind.Close, new RectangleF(dismiss.X + 8f, dismiss.Y + 8f, 12f, 12f), disHov ? ColTextPrimary : Theme.TextTertiary, 1.7f);
+        _hitZones.Add(new HitZone(dismiss, "upd_banner_dismiss", () => { _ctx.Updater.DismissBanner(); Invalidate(); }, I18n.T("Hide for this session", "Скрыть до перезапуска")));
+        right = dismiss.Left - 8f;
+
+        right = DrawPillButtonRight(g, right, btnY, I18n.T("What's new", "Что нового"), ColPillIdle, ColTextPrimary, "upd_banner_notes", () => _ctx.OpenUpdateNotesFromUi(this)) - 8f;
+
+        if (!busy)
+        {
+            string actLbl = waiting
+                ? I18n.T("Install now", "Установить сейчас")
+                : I18n.T("Update", "Обновить");
+            right = DrawPillButtonRight(g, right, btnY, actLbl, ColBlue, Color.White, "upd_banner_install", () => _ctx.InstallUpdateFromUi(this)) - 12f;
+        }
+        else
+        {
+            string progLbl = st.Stage == UpdateStage.Installing
+                ? I18n.T("Installing…", "Установка…")
+                : I18n.Format("Downloading… {0}%", "Загрузка… {0}%", st.ProgressPercent);
+            float pw = Theme.MeasureText(g, progLbl, UiSmallStrong).Width + 16f;
+            Theme.DrawText(g, progLbl, UiSmallStrong, Theme.AccentText, new RectangleF(right - pw, btnY, pw, 32f), StringAlignment.Far, StringAlignment.Center);
+            right -= pw + 12f;
+        }
+
+        float tx = tile.Right + 14f;
+        float tw = Math.Max(80f, right - tx);
+        string title = waiting
+            ? I18n.Format("Update {0} is ready — waiting for MCP server to stop", "Обновление {0} готово — ждёт выключения MCP-сервера", rel.Tag)
+            : I18n.Format("ZeroIDE MCP {0} is available", "Доступно обновление ZeroIDE MCP {0}", rel.Tag);
+        string sub = busy
+            ? st.Message
+            : (!string.IsNullOrWhiteSpace(rel.NotesSummary)
+                ? rel.NotesSummary
+                : I18n.Format("Current version {0} · verified via SHA-256 · settings are kept", "Текущая версия {0} · проверка SHA-256 · настройки сохраняются", st.CurrentVersion));
+        Theme.DrawText(g, title, UiBodyStrong, ColTextPrimary, new RectangleF(tx, y + 10f, tw, 22f));
+        Theme.DrawText(g, sub, UiSmall, ColTextSecondary, new RectangleF(tx, y + 34f, tw, 20f));
+
+        return y + h + 16f;
+    }
+
     // ============================================================ 7. ABOUT (macOS "About This Mac" Style — Reference 4)
     private float DrawAboutContent(Graphics g, float x, float w, float y)
     {
@@ -1924,14 +2136,8 @@ internal sealed partial class SettingsForm : Form
         var heroRect = new RectangleF(x, y, w, 132f);
         DrawCardSurface(g, heroRect);
 
-        var iconRect = new RectangleF(x + (w - 52f) / 2f, y + 16f, 52f, 52f);
-        using (var grad = new LinearGradientBrush(iconRect, Theme.AccentHover, Theme.AccentPressed, 90f))
-        using (var path = CreateRoundRect(iconRect, 14f))
-        {
-            g.FillPath(grad, path);
-        }
-        Theme.StrokeRound(g, RectangleF.Inflate(iconRect, -0.5f, -0.5f), 13.5f, Theme.WithAlpha(Color.White, 40));
-        Theme.DrawText(g, "Z", UiFont(21f, true), Color.White, new RectangleF(iconRect.X, iconRect.Y - 1f, iconRect.Width, iconRect.Height), StringAlignment.Center, StringAlignment.Center, ellipsis: false);
+        var iconRect = new RectangleF(x + (w - 56f) / 2f, y + 14f, 56f, 56f);
+        Theme.DrawLogo(g, iconRect);
 
         var hFont = UiFont(15.0f, true);
         var sFont = UiFont(9.75f);
@@ -1940,12 +2146,93 @@ internal sealed partial class SettingsForm : Form
         var centerFmt = new StringFormat { Alignment = StringAlignment.Center };
 
         g.DrawString(Theme.ProductName, hFont, pBrush, new RectangleF(x, y + 74f, w, 26f), centerFmt);
-        g.DrawString(I18n.T("Version 0.5 · OAuth 2.1, Access Registry & Confinement Edition", "Версия 0.5 · OAuth 2.1, Access Registry & Confinement Edition"), sFont, sBrush, new RectangleF(x, y + 100f, w, 20f), centerFmt);
+        g.DrawString(
+            I18n.Format("Version {0} · risk cards, self-protection and undo of agent changes", "Версия {0} · карточки риска, самозащита и отмена правок агентов", AppUpdater.CurrentVersion),
+            sFont, sBrush, new RectangleF(x, y + 100f, w, 20f), centerFmt);
 
         y += 148f;
+
+        // Updates section
+        y = DrawGroupTitle(g, x, y, I18n.T("UPDATES", "ОБНОВЛЕНИЯ"));
+        var upd = _ctx.Updater.State;
+        float rowH = RowH;
+        var updCard = new RectangleF(x, y, w, rowH * 3f);
+        DrawCardSurface(g, updCard);
+
+        (Color stCol, string stIcon, string stTitle, string stSub) = DescribeUpdateStatus(upd);
+        bool busy = upd.Stage is UpdateStage.Checking or UpdateStage.Downloading or UpdateStage.Installing;
+
+        float rightBtn = x + w - 16f;
+        float btnY = y + 16f;
+        if (upd.HasUpdate && !string.IsNullOrWhiteSpace(upd.Latest?.ReleaseNotes))
+            rightBtn = DrawPillButtonRight(g, rightBtn, btnY, I18n.T("What's new", "Что нового"), ColPillIdle, ColTextPrimary, "abt_upd_notes", () => _ctx.OpenUpdateNotesFromUi(this)) - 8f;
+        else
+            rightBtn = DrawPillButtonRight(g, rightBtn, btnY, "GitHub", ColPillIdle, ColTextPrimary, "abt_upd_releases", () => _ctx.OpenReleasesPageFromUi()) - 8f;
+        if (upd.HasUpdate && !busy)
+        {
+            string instLabel = upd.Latest != null
+                ? I18n.Format("Install {0}", "Установить {0}", upd.Latest.Tag)
+                : I18n.T("Install", "Установить");
+            rightBtn = DrawPillButtonRight(g, rightBtn, btnY, instLabel, ColBlue, Color.White, "abt_upd_install", () => _ctx.InstallUpdateFromUi(this)) - 8f;
+        }
+        if (!busy)
+        {
+            rightBtn = DrawPillButtonRight(g, rightBtn, btnY, I18n.T("Check now", "Проверить"), ColPillIdle, ColTextPrimary, "abt_upd_check", () => { _ctx.CheckForUpdatesFromUi(); Invalidate(); }) - 12f;
+        }
+        else
+        {
+            string busyLbl = upd.Stage == UpdateStage.Downloading
+                ? I18n.Format("{0}%", "{0}%", upd.ProgressPercent)
+                : I18n.T("Working…", "Проверка…");
+            float bw = Theme.MeasureText(g, busyLbl, UiSmallStrong).Width + 14f;
+            Theme.DrawText(g, busyLbl, UiSmallStrong, Theme.AccentText, new RectangleF(rightBtn - bw, btnY, bw, 32f), StringAlignment.Far, StringAlignment.Center);
+            rightBtn -= bw + 12f;
+        }
+
+        DrawSettingRow(g, x, y, Math.Max(180f, rightBtn - x), rowH, stCol, stIcon, stTitle, stSub, drawDivider: true);
+        if (upd.Stage == UpdateStage.Downloading && upd.ProgressPercent > 0)
+        {
+            float pw = Math.Clamp(upd.ProgressPercent / 100f, 0.04f, 1f) * (w - 32f);
+            Theme.FillRound(g, new RectangleF(x + 16f, y + rowH - 4f, pw, 3f), 1.5f, ColBlue);
+        }
+
+        y += rowH;
+        bool checkOn = _ctx.Config.CheckUpdatesEnabled;
+        DrawSettingRow(g, x, y, w - 90f, rowH, ColBlue, "globe",
+            I18n.T("Check for updates automatically", "Проверять обновления автоматически"),
+            I18n.T("Quietly checks GitHub Releases on startup and every 12 hours.", "Тихо проверяет GitHub Releases при запуске и раз в 12 часов."),
+            drawDivider: true);
+        DrawIosToggle(g, x + w - 62f, y + 20f, checkOn, "abt_upd_check_toggle", () =>
+        {
+            _ctx.SetCheckUpdatesEnabledFromUi(!checkOn);
+            Invalidate();
+        });
+
+        y += rowH;
+        bool autoOn = _ctx.Config.AutoUpdateEnabled;
+        DrawSettingRow(g, x, y, w - 90f, rowH, ColGreen, "shield",
+            I18n.T("Install updates automatically when MCP is off", "Устанавливать обновления автоматически при выключенном MCP"),
+            I18n.T("Verifies SHA-256 checksum and applies only when no agent session is active.", "Проверяет SHA-256 и обновляет приложение только когда MCP-сервер выключен."),
+            drawDivider: false);
+        DrawIosToggle(g, x + w - 62f, y + 20f, autoOn, "abt_upd_auto_toggle", () =>
+        {
+            _ctx.SetAutoUpdateEnabledFromUi(!autoOn);
+            Invalidate();
+        });
+
+        y += rowH + 18f;
+        y = DrawGroupTitle(g, x, y, I18n.T("CONTACT", "СВЯЗЬ"));
+        var contactCard = new RectangleF(x, y, w, rowH);
+        DrawCardSurface(g, contactCard);
+        DrawSettingRow(g, x, y, w - 165f, rowH, ColCyan, "user",
+            I18n.T("Author on Telegram (@danywalery)", "Автор в Telegram (@danywalery)"),
+            I18n.T("Ideas, feedback, collaboration and offers", "Идеи, советы, сотрудничество и предложения"),
+            drawDivider: false);
+        DrawPillButtonRight(g, x + w - 16f, y + 16f, I18n.T("Open Telegram", "Открыть Telegram"), ColPillIdle, ColTextPrimary, "abt_contact_tg", () => DesktopLauncher.OpenUrl("https://t.me/danywalery"));
+
+        y += rowH + 18f;
         y = DrawGroupTitle(g, x, y, I18n.T("FILE AND FOLDER LOCATIONS", "РАСПОЛОЖЕНИЕ ФАЙЛОВ И ПАПОК"));
 
-        float rowH = RowH;
         var card = new RectangleF(x, y, w, rowH * 4f);
         DrawCardSurface(g, card);
 
@@ -1967,8 +2254,45 @@ internal sealed partial class SettingsForm : Form
         return y + rowH + 16f;
     }
 
+    private static (Color Col, string Icon, string Title, string Sub) DescribeUpdateStatus(UpdateStateSnapshot st)
+    {
+        string checkedSuffix = st.LastCheckedAt is { } ts
+            ? " · " + I18n.Format("checked at {0}", "проверено в {0}", ts.ToLocalTime().ToString("HH:mm"))
+            : "";
+        return st.Stage switch
+        {
+            UpdateStage.Checking => (ColBlue, "globe",
+                I18n.T("Checking for updates…", "Проверяем обновления…"),
+                AppUpdater.RepoOwner + "/" + AppUpdater.RepoName),
+            UpdateStage.Available when st.Latest != null => (ColBlue, "globe",
+                I18n.Format("Update available: {0}", "Доступно обновление: {0}", st.Latest.Tag),
+                (!string.IsNullOrWhiteSpace(st.Latest.NotesSummary) ? st.Latest.NotesSummary : I18n.Format("Current: {0} · SHA-256 verified", "Текущая: {0} · проверка SHA-256", st.CurrentVersion)) + checkedSuffix),
+            UpdateStage.Downloading => (ColBlue, "globe",
+                I18n.Format("Downloading update ({0}%)…", "Скачиваем обновление ({0}%)…", st.ProgressPercent),
+                st.Message),
+            UpdateStage.ReadyToInstall when st.Latest != null => (ColGreen, "shield",
+                I18n.Format("Update {0} verified (SHA-256 OK)", "Обновление {0} проверено (SHA-256 OK)", st.Latest.Tag),
+                I18n.T("Ready to install. Settings, tokens and history will be preserved.", "Готово к установке. Настройки, токены и история сохранятся.")),
+            UpdateStage.WaitingForServerOff when st.Latest != null => (ColOrange, "timer",
+                I18n.Format("Update {0} waiting for MCP server to stop", "Обновление {0} ждёт выключения MCP-сервера", st.Latest.Tag),
+                I18n.T("Will install automatically as soon as MCP goes offline, or click Install.", "Установится автоматически после выключения MCP, или нажмите «Установить».")),
+            UpdateStage.Installing => (ColGreen, "shield",
+                I18n.T("Installing update…", "Устанавливаем обновление…"),
+                I18n.T("ZeroIDE MCP will restart automatically.", "ZeroIDE MCP перезапустится автоматически.")),
+            UpdateStage.Error => (ColRed, "info",
+                I18n.T("Update check failed", "Не удалось проверить обновления"),
+                (string.IsNullOrWhiteSpace(st.Message) ? AppUpdater.RepoOwner + "/" + AppUpdater.RepoName : st.Message) + checkedSuffix),
+            UpdateStage.UpToDate => (ColGreen, "shield",
+                I18n.Format("Up to date ({0})", "Установлена актуальная версия ({0})", st.CurrentVersion),
+                AppUpdater.RepoOwner + "/" + AppUpdater.RepoName + checkedSuffix),
+            _ => (ColBlue, "globe",
+                I18n.Format("Current version: {0}", "Текущая версия: {0}", st.CurrentVersion),
+                I18n.T("Source: ", "Источник: ") + AppUpdater.RepoOwner + "/" + AppUpdater.RepoName),
+        };
+    }
+
     // ============================================================ REDESIGN HELPERS (reference design system)
-    private const string AppVersion = "v0.5";
+    private static string AppVersion => "v" + AppUpdater.CurrentVersion;
 
     private static string? SectionSubtitle(string section) => section switch
     {
@@ -1979,9 +2303,10 @@ internal sealed partial class SettingsForm : Form
         "notifications" => I18n.T("Card style and notification behaviour in the tray.", "Стиль карточек и поведение уведомлений в трее."),
         "connection" => I18n.T("How AI connects to this PC and which URL to use.", "Как AI подключается к этому ПК и какую ссылку использовать."),
         "audit" => I18n.T("History of tool calls and approval decisions.", "История вызовов инструментов и решений по подтверждениям."),
+        "changes" => I18n.T("Files agents wrote, edited, moved or deleted — undo any of them in one click.", "Файлы, которые агенты записали, изменили, переместили или удалили, — любую правку можно отменить."),
         "screenshots" => I18n.T("Archive of approved screenshots and its folder.", "Архив одобренных скриншотов и папка для их хранения."),
         "uninstall" => I18n.T("Remove the app and all its local data from this PC.", "Удалить приложение и все его локальные данные с этого ПК."),
-        "about" => I18n.T("App version and file locations.", "Версия приложения и расположение файлов."),
+        "about" => I18n.T("App version, updates and file locations.", "Версия приложения, обновления и расположение файлов."),
         _ => null,
     };
 
@@ -2114,11 +2439,33 @@ internal sealed partial class SettingsForm : Form
 
     private void ToggleRedFlags()
     {
-        bool rfOn = _perms.RedFlags?.Enabled != false && _perms.RedFlags?.ElevateToAsk != false;
-        _perms.RedFlags ??= new RedFlagsConfig();
-        _perms.RedFlags.Enabled = !rfOn;
-        _perms.RedFlags.ElevateToAsk = !rfOn;
-        PermissionsStore.Save(_perms);
+        bool highOn = PermissionsStore.IsHighRiskFilterEnabled(_perms);
+        bool critOn = PermissionsStore.IsCriticalGuardEnabled(_perms);
+        PermissionsStore.ApplyRiskToggles(_perms, !highOn, critOn);
+    }
+
+    private void ToggleCriticalGuard()
+    {
+        bool highOn = PermissionsStore.IsHighRiskFilterEnabled(_perms);
+        bool critOn = PermissionsStore.IsCriticalGuardEnabled(_perms);
+        if (critOn)
+        {
+            bool ok = ConfirmDisableCriticalForTests != null
+                ? ConfirmDisableCriticalForTests()
+                : MessageBox.Show(
+                    this,
+                    I18n.T(
+                        "Critical protection requires one-time approval for actions touching disks, shadow copies, Defender/firewall rules, saved credentials, and system settings — and prevents temporary grants from covering them.\n\n" +
+                        "Disable critical action protection? Together with turning off High-risk & Red-Flag protection above and allowing tools, this grants the agent full unattended autonomy.",
+                        "Защита от критичных действий принудительно спрашивает разовое подтверждение при попытке затронуть диски, теневые копии, Defender/брандмауэр, сохранённые ключи и системные настройки, и не даёт временным разрешениям покрывать такие вызовы.\n\n" +
+                        "Отключить критическую защиту? Вместе с выключенным фильтром опасных команд (Red-Flag / High) и разрешёнными инструментами это даст агенту полную автономию."),
+                    I18n.T("Disable critical action protection?", "Отключить защиту от критичных действий?"),
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning,
+                    MessageBoxDefaultButton.Button2) == DialogResult.Yes;
+            if (!ok) return;
+        }
+        PermissionsStore.ApplyRiskToggles(_perms, highOn, !critOn);
     }
 
     private void ToggleConfinement()
@@ -2473,13 +2820,19 @@ internal sealed partial class SettingsForm : Form
 
     private static GraphicsPath CreateRoundRect(RectangleF r, float radius) => Theme.RoundRect(r, radius);
 
-    public void RenderPreviewToFile(string filePath, string section)
+    public void RenderPreviewToFile(string filePath, string section, int scrollY = 0)
     {
         _activeSection = section;
-        _scrollY = 0;
+        _scrollY = Math.Max(0, scrollY);
+        if (section == "changes") LoadChangesNow();
         using var bmp = new Bitmap(Width, Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
         using var g = Graphics.FromImage(bmp);
         using var pe = new PaintEventArgs(g, new Rectangle(0, 0, Width, Height));
+        if (scrollY > 0)
+        {
+            OnPaint(pe);
+            _scrollY = Math.Clamp(scrollY, 0, Math.Max(0, _maxScrollY));
+        }
         g.Clear(Color.Transparent);
         OnPaint(pe);
         bmp.Save(filePath, System.Drawing.Imaging.ImageFormat.Png);

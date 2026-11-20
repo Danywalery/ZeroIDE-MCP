@@ -54,7 +54,7 @@ After the owner enables MCP, run the installed helper once:
 & "$env:LOCALAPPDATA\ZeroIDE-MCP\tools\Test-LocalMcp.ps1"
 ```
 
-It reads credentials only in local memory, performs `initialize → initialized → tools/list`, checks the 14 built-in tools and closes its session. It never invokes tools, prints a token, enables MCP or counts as a real AI sign-in.
+It reads credentials only in local memory, performs `initialize → initialized → tools/list`, checks that the 14 core tools are present (the 0.5 server lists 19) and closes its session. It never invokes tools, prints a token, enables MCP or counts as a real AI sign-in.
 
 - `local_ready`: continue. This proves only local readiness.
 - `waiting_for_owner` / `ENABLE_MCP`: ask the owner to enable, then rerun once after their confirmation.

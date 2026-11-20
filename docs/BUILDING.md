@@ -31,11 +31,13 @@ The Node.js suites copy the server to a temporary folder and use free ports, a f
 | `node tests/connections-runtime/server-proof.mjs` | 26 | server side of connection checks: minimal health, verifier versus real client |
 | `node tests/security-v04.mjs` | 68 | authentication fails closed, no tokens in URLs, rate and size limits, error format |
 | `node tests/isolated-v04.mjs` | 61 | folder confinement, token scopes, limits and expiry, rotation and revocation, client registration policy, OAuth flow |
+| `node tests/guardian-v05.mjs` | 72 | self-protection, risk ratings and approvals, change history and undo, `file_ops`, `system_info`, `read_image`, `edit_file` batches |
 | `dotnet run --project tests/connections-v2/Tests.csproj -c Release` | 45 | connection registry |
 | `.\tests\connections-v2\cli-smoke.ps1` | 8 | connection CLI; build it first with `dotnet build tools/ConnectionCtl/ConnectionCtl.csproj -c Release` |
-| `.\tests\installer-smoke.ps1` | 18 | installer and package contract |
+| `.\tests\installer-smoke.ps1` | 20 | installer and package contract |
 | `.\tests\onboarding-helpers.ps1` | 57 | onboarding helper scripts against a temporary MCP server |
 | `dotnet run --project tests/connections-runtime/RuntimeTests.csproj -c Release -- output/renders` | 80 | tray connection runtime; renders UI states to `output/renders` |
+| `dotnet run --project tests/tray-ui/TrayUiTests.csproj -c Release -- output/tray-ui` | 53 | tray palette and logo, message banner with **Open**, risk and diff approval cards, Settings → Changes and undo; renders to `output/tray-ui` |
 
 CI (`.github/workflows/ci.yml`) runs all of them on every push and pull request.
 

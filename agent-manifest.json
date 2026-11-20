@@ -60,13 +60,13 @@
                     "installerPrintsSecrets":  false
                 },
     "verify":  {
-                   "expectedTools":  14,
+                   "expectedTools":  19,
                    "port":  39011,
                    "toolsList":  "http://127.0.0.1:39011/mcp",
                    "toolsListAcceptHeader":  "application/json, text/event-stream",
                    "clientName":  "ZeroIDE connection verifier"
                },
-    "version":  "0.4.0",
+    "version":  "0.5.0",
     "onboarding":  {
                        "localCheck":  "tools/Test-LocalMcp.ps1",
                        "preferredAuthentication":  "OAuth, otherwise named scoped expiring token",

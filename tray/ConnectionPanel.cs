@@ -40,6 +40,7 @@ internal sealed partial class SettingsForm
             case "retire": _ctx.RetirePreviousConnectionFromUi(); break;
             case "restore": _ctx.RestoreConnectionFromUi(); break;
             case "guide_hide": _ctx.HideConnectionProgress(); break;
+            case "wizard_internet": _ctx.OpenSetupWizard("internet"); break;
             default:
                 if (id.StartsWith("agent_")) { _connectionGoal = id[6..]; _ctx.CopyConnectionAgentTask(_connectionGoal); _connectionTaskCopied = true; }
                 break;

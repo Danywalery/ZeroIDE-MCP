@@ -57,10 +57,12 @@ internal sealed class TrayConfig
     public int DefaultGrantMinutes { get; set; } = 10;
     public string DefaultGrantScope { get; set; } = "tool";
     public string CardStyle { get; set; } = "glass";     // glass | light | compact | neon
-    public string TrayMenuMode { get; set; } = "classic"; // classic | panel | mini
+    public string TrayMenuMode { get; set; } = "panel";  // classic | panel | mini
     public string ApprovalSound { get; set; } = "chime";  // chime | ping | bell | none
     public string Language { get; set; } = "en";         // en | ru
     public bool SetupCompleted { get; set; } = false;     // connect wizard finished or dismissed once
+    public bool CheckUpdatesEnabled { get; set; } = true; // check GitHub Releases on startup and every 12h
+    public bool AutoUpdateEnabled { get; set; } = false;  // off by default; applies only when MCP server is off
 }
 
 /// <summary>Live mirror of the screenshot-archive settings for tray-side
@@ -166,8 +168,14 @@ internal static class Program
             Application.Run(new SetupWizardForm(packageRoot, stepArg > 0 && stepArg + 1 < args.Length ? args[stepArg + 1] : ""));
             return;
         }
-        string logFile = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ZeroIDE-MCP", "logs", "tray.log");
-        using var mutex = new Mutex(true, "ZeroIDE-MCP.SingleInstance", out bool createdNew);
+        string? rawInstance = Environment.GetEnvironmentVariable("ZEROIDE_INSTANCE_ID");
+        string safeInstance = string.IsNullOrWhiteSpace(rawInstance) ? "" : Regex.Replace(rawInstance.Trim(), @"[^a-zA-Z0-9_-]", "");
+        string logRoot = safeInstance.Length > 0 || File.Exists(Path.Combine(AppContext.BaseDirectory, "tray-config.json"))
+            ? AppContext.BaseDirectory
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "ZeroIDE-MCP");
+        string logFile = Path.Combine(logRoot, "logs", "tray.log");
+        string mutexName = safeInstance.Length > 0 ? "ZeroIDE-MCP.SingleInstance." + safeInstance : "ZeroIDE-MCP.SingleInstance";
+        using var mutex = new Mutex(true, mutexName, out bool createdNew);
         if (!createdNew)
         {
             try { File.AppendAllText(logFile, $"{DateTime.Now:s}  SingleInstance mutex already held\r\n"); } catch { }
@@ -221,6 +229,8 @@ internal sealed partial class TrayContext : ApplicationContext
     private Process? _tunnel;
     private IntPtr _tunnelJob = IntPtr.Zero;
     private ApprovalControlServer? _controlServer;
+    private TelegramNotifier? _telegram;
+    internal TelegramNotifier Telegram => _telegram ??= new TelegramNotifier(TelegramNotifier.DefaultConfigPath, Log);
     private SettingsForm? _settingsForm;
     private TrayPopupForm? _popupForm;
     private MissedRequestsForm? _missedForm;
@@ -242,6 +252,35 @@ internal sealed partial class TrayContext : ApplicationContext
     private bool _blinkPhase;
     private string _state = "off";        // off | starting | on | error
     private string _stateText = "Off";
+    private SynchronizationContext? _uiCtx;
+    private AppUpdater? _updater;
+    private readonly System.Windows.Forms.Timer _updateTimer = new() { Interval = 15_000 };
+
+    internal AppUpdater Updater => _updater ??= CreateUpdater();
+
+    private AppUpdater CreateUpdater()
+    {
+        var u = new AppUpdater(
+            AppContext.BaseDirectory,
+            GetLogDirPath,
+            () => _state == "on" || _state == "starting",
+            Log,
+            () =>
+            {
+                if (_uiCtx != null) _uiCtx.Post(_ => ExitTray(), null);
+                else ExitTray();
+            });
+        u.StateChanged += () =>
+        {
+            void RefreshUi()
+            {
+                if (_settingsForm != null && !_settingsForm.IsDisposed) _settingsForm.Invalidate();
+            }
+            if (_uiCtx != null) _uiCtx.Post(_ => RefreshUi(), null);
+            else RefreshUi();
+        };
+        return u;
+    }
 
     private readonly ToolStripMenuItem _statusItem = new() { Enabled = false };
     private readonly ToolStripMenuItem _missedItem = new() { Text = "Missed: 0", Visible = false };
@@ -256,6 +295,7 @@ internal sealed partial class TrayContext : ApplicationContext
     public string CurrentStateText => _stateText;
     public DateTime? SessionDeadline => _deadline;
     public int ActiveGrantsCount => _activeGrantsCount;
+    public int ActiveCalls => _activeCalls;
     public int MissedCount => _missedCount;
     public bool ConfinementEnabled => _confinementEnabled;
     public string ConfinementRoot => _confinementRoot;
@@ -282,6 +322,7 @@ internal sealed partial class TrayContext : ApplicationContext
         _icon.MouseUp += OnTrayIconMouseUp;
 
         var uiCtx = SynchronizationContext.Current ?? new WindowsFormsSynchronizationContext();
+        _uiCtx = uiCtx;
         _controlServer = new ApprovalControlServer(
             _cfg.ControlPort > 0 ? _cfg.ControlPort : 39012,
             () => _cfg.ControlSecret,
@@ -295,7 +336,8 @@ internal sealed partial class TrayContext : ApplicationContext
                 var result = new TaskCompletionSource<(int, string)>(TaskCreationOptions.RunContinuationsAsynchronously);
                 uiCtx.Post(async _ => { try { result.SetResult(await HandleConnectionApi(method, path, body)); } catch { result.TrySetResult((500, "{}")); } }, null);
                 return result.Task;
-            });
+            },
+            (id, agent, link) => uiCtx.Post(_ => SetUserMessageDetails(id, agent, link), null));
         _controlServer.Start();
 
         ApprovalToastManager.PendingChanged += () =>
@@ -310,7 +352,32 @@ internal sealed partial class TrayContext : ApplicationContext
         _blinkTimer.Tick += (_, _) => OnBlinkTick();
         _poll.Tick += async (_, _) => await PollAsync();
         _poll.Start();
+
+        bool demoUpdate = Array.IndexOf(Environment.GetCommandLineArgs(), "--demo-update") >= 0;
+        if (demoUpdate)
+        {
+            Updater.SetStateForPreview(AppUpdater.CreateDemoUpdateSnapshot());
+        }
+        else
+        {
+            _updateTimer.Tick += (_, _) =>
+            {
+                _updateTimer.Interval = 12 * 60 * 60 * 1000; // check every 12 hours after initial startup check
+                if (_cfg.CheckUpdatesEnabled)
+                    _ = Updater.CheckAsync(_cfg.AutoUpdateEnabled, userInitiated: false);
+            };
+            _updateTimer.Start();
+        }
         Log("tray v0.2.1 started (server off)");
+        // --open popup|<settings section> [--open-delay ms]: development aid for screenshots and tests.
+        string[] openArgs = Environment.GetCommandLineArgs(); int openAt = Array.IndexOf(openArgs, "--open");
+        if (openAt > 0 && openAt + 1 < openArgs.Length)
+        {
+            int delayAt = Array.IndexOf(openArgs, "--open-delay");
+            var opener = new System.Windows.Forms.Timer { Interval = delayAt > 0 && delayAt + 1 < openArgs.Length && int.TryParse(openArgs[delayAt + 1], out int ms) ? Math.Max(100, ms) : 1500 };
+            opener.Tick += (_, _) => { opener.Stop(); opener.Dispose(); if (openArgs[openAt + 1] == "popup") ShowTrayPopup(_cfg.TrayMenuMode == "classic" ? "panel" : _cfg.TrayMenuMode); else OpenSettingsWindow(openArgs[openAt + 1]); };
+            opener.Start();
+        }
         if (!_cfg.SetupCompleted && !ConnectionIsPublic)
         {
             var once = new System.Windows.Forms.Timer { Interval = 700 };
@@ -326,12 +393,21 @@ internal sealed partial class TrayContext : ApplicationContext
 
     private SetupWizardForm? _setupForm;
     /// <summary>Connect wizard: which AI, how to reach this PC, hand-off to the client. Reopenable from Connection.</summary>
-    public void OpenSetupWizard()
+    public void OpenSetupWizard(string? initialStep = null)
     {
         try
         {
-            if (_setupForm == null || _setupForm.IsDisposed) { _setupForm = new SetupWizardForm(this); _setupForm.Show(); }
-            else _setupForm.Activate();
+            if (_setupForm == null || _setupForm.IsDisposed)
+            {
+                _setupForm = new SetupWizardForm(this);
+                if (!string.IsNullOrWhiteSpace(initialStep)) _setupForm.Navigate(initialStep);
+                _setupForm.Show();
+            }
+            else
+            {
+                if (!string.IsNullOrWhiteSpace(initialStep)) _setupForm.Navigate(initialStep);
+                _setupForm.Activate();
+            }
         }
         catch (Exception ex) { Log("setup wizard error: " + ex.Message); }
     }
@@ -353,26 +429,89 @@ internal sealed partial class TrayContext : ApplicationContext
     private string _userMessageText = "";
     private string _userMessageKind = "status";
     private string _userMessageId = "";
+    private string _userMessageAgent = "";
 
     private readonly List<McpToolEvent> _recentEvents = new();
-    private string _taskTitle = "";
-    private string _taskCurrent = "";
-    private List<string> _taskDone = new();
-    private List<string> _taskNext = new();
-    private string _taskAgent = "";
-    private DateTime? _taskStartedAt;
-    private DateTime _taskUpdatedAt = DateTime.MinValue;
+    private readonly List<AgentTaskState> _agentTasks = new();
+    private readonly List<OwnerMessageStatusItem> _ownerMessages = new();
+    private readonly List<ChatHistoryItem> _chatHistory = new();
+    private string _selectedAgentId = "";
+    private bool _holdAfterTask;
+    internal bool? StandbyToolEnabledOverride { get; set; }
+
+    internal bool StandbyToolEnabled => StandbyToolEnabledOverride ?? PermissionsStore.IsToolEnabled("await_owner");
+    internal bool HoldAfterTask => StandbyToolEnabled && _holdAfterTask;
+
+    private static string NormalizeAgentKey(string? raw)
+    {
+        string s = (raw ?? "").Trim();
+        if (string.IsNullOrEmpty(s)) return "default";
+        return Regex.Replace(s.ToLowerInvariant(), @"\s+", "-");
+    }
+
+    private AgentTaskState? CurrentSelectedTask
+    {
+        get
+        {
+            var active = _agentTasks.Where(t => !string.IsNullOrWhiteSpace(t.Title)).ToList();
+            if (active.Count == 0) return null;
+            var hit = active.FirstOrDefault(t => t.AgentId == _selectedAgentId);
+            return hit ?? active.OrderByDescending(t => t.UpdatedAt).First();
+        }
+    }
+
+    internal IReadOnlyList<AgentTaskState> ActiveAgentTasks =>
+        _agentTasks.Where(t => !string.IsNullOrWhiteSpace(t.Title)).OrderBy(t => t.StartedAt ?? t.UpdatedAt).ToList();
+
+    internal IReadOnlyList<AgentTaskState> AllKnownAgents => _agentTasks;
+    internal IReadOnlyList<OwnerMessageStatusItem> OwnerMessages => _ownerMessages;
+    internal IReadOnlyList<ChatHistoryItem> ChatHistory => _chatHistory;
+    internal int StandbyRemainingSec =>
+        CurrentSelectedTask?.StandbyRemainingSec > 0
+            ? CurrentSelectedTask.StandbyRemainingSec
+            : (_agentTasks.Select(a => a.StandbyRemainingSec).DefaultIfEmpty(0).Max());
+
+    internal string SelectedAgentId
+    {
+        get => CurrentSelectedTask?.AgentId ?? _selectedAgentId;
+        set => _selectedAgentId = value ?? "";
+    }
 
     internal string UserMessageText => _userMessageText;
     internal string UserMessageKind => _userMessageKind;
+    internal string UserMessageAgent => _userMessageAgent;
+    private MessageLink? _userMessageLink;
+    internal MessageLink? UserMessageLink => string.IsNullOrEmpty(_userMessageText) ? null : _userMessageLink;
+
+    /// <summary>Second half of /message/show: who sent the banner and its optional one-click link.</summary>
+    internal void SetUserMessageDetails(string id, string agent, MessageLink? link)
+    {
+        if (string.IsNullOrEmpty(_userMessageText) || (_userMessageId ?? "") != (id ?? "")) return;
+        _userMessageAgent = (agent ?? "").Trim();
+        _userMessageLink = link;
+        if (link != null) Log("user message link: " + link.Kind + (link.Reveal ? " (reveal)" : ""));
+        Telegram.NotifyAgentMessage(_userMessageId ?? "", _userMessageAgent, _userMessageKind, _userMessageText, _userMessageLink);
+        UpdateStatusText();
+    }
+
+    /// <summary>Owner clicked the banner button. Re-validated by MessageLink.Open (exists, safe kind).</summary>
+    internal void OpenUserMessageLink()
+    {
+        var link = UserMessageLink;
+        if (link == null) return;
+        if (!link.Open()) Balloon(I18n.T("Cannot open", "Не удалось открыть"), I18n.T("The file or folder no longer exists.", "Файл или папка больше не существуют."));
+        else Log("user message link opened: " + link.Kind);
+    }
     internal IReadOnlyList<McpToolEvent> RecentEvents => _recentEvents;
-    internal string TaskTitle => _taskTitle;
-    internal string TaskCurrent => _taskCurrent;
-    internal IReadOnlyList<string> TaskDone => _taskDone;
-    internal IReadOnlyList<string> TaskNext => _taskNext;
-    internal string TaskAgent => _taskAgent;
-    internal DateTime? TaskStartedAt => _taskStartedAt;
-    internal DateTime TaskUpdatedAt => _taskUpdatedAt;
+    internal string TaskTitle => CurrentSelectedTask?.Title ?? "";
+    internal string TaskCurrent => CurrentSelectedTask?.Current ?? "";
+    internal string TaskStatus => CurrentSelectedTask?.Status ?? "running";
+    internal IReadOnlyList<string> TaskDone => (IReadOnlyList<string>?)CurrentSelectedTask?.Done ?? Array.Empty<string>();
+    internal IReadOnlyList<string> TaskNext => (IReadOnlyList<string>?)CurrentSelectedTask?.Next ?? Array.Empty<string>();
+    internal string TaskAgent => CurrentSelectedTask?.AgentName ?? "";
+    internal DateTime? TaskStartedAt => CurrentSelectedTask?.StartedAt;
+    internal DateTime? TaskCompletedAt => CurrentSelectedTask?.CompletedAt;
+    internal DateTime TaskUpdatedAt => CurrentSelectedTask?.UpdatedAt ?? DateTime.MinValue;
     internal bool ShowTaskStatus => _cfg.ShowTaskStatus;
 
     internal void SetUserMessage(string text, string kind, bool persistent, string id)
@@ -387,11 +526,14 @@ internal sealed partial class TrayContext : ApplicationContext
         {
             if (kind == "request")
                 Balloon(I18n.T("Agent message", "Сообщение агента"), clean);
+            Telegram.NotifyAgentMessage(id ?? "", "", kind, clean, null);
             return;
         }
         _userMessageText = clean;
         _userMessageKind = (kind == "request" || kind == "warning") ? kind : "status";
         _userMessageId = id ?? "";
+        _userMessageLink = null; // a new banner never inherits the previous banner's button
+        _userMessageAgent = "";
         Log($"user message ({_userMessageKind}): {_userMessageText}");
         if (_userMessageKind == "request")
             Balloon(I18n.T("Agent message", "Сообщение агента"), _userMessageText);
@@ -417,11 +559,12 @@ internal sealed partial class TrayContext : ApplicationContext
                 tunnelExited = _tunnel?.HasExited,
                 statusItemText = _statusItem.Text,
                 logDir = LogDirPath,
-                taskTitle = _taskTitle,
-                taskCurrent = _taskCurrent,
-                taskAgent = _taskAgent,
-                taskStartedAt = _taskStartedAt?.ToString("o"),
-                taskUpdatedAt = _taskUpdatedAt.ToString("o"),
+                taskTitle = TaskTitle,
+                taskCurrent = TaskCurrent,
+                taskAgent = TaskAgent,
+                taskStartedAt = TaskStartedAt?.ToString("o"),
+                taskUpdatedAt = TaskUpdatedAt.ToString("o"),
+                activeAgentTasks = ActiveAgentTasks.Select(a => new { a.AgentId, a.AgentName, a.Title, a.Current }).ToArray(),
                 recentEvents = _recentEvents.Select(e => new { e.Id, e.Tool, e.Ts, e.Status, detail = (e.Detail ?? "").Length > 80 ? (e.Detail ?? "")[..80] : (e.Detail ?? "") }).ToArray(),
                 logFileExists = File.Exists(Path.Combine(LogDirPath, "tray.log")),
             });
@@ -434,39 +577,165 @@ internal sealed partial class TrayContext : ApplicationContext
         _userMessageText = "";
         _userMessageKind = "status";
         _userMessageId = "";
+        _userMessageAgent = "";
+        _userMessageLink = null;
         UpdateStatusText();
     }
 
     internal void SetTaskStatus(string title, string current, string[] done, string[] next, string startedAt, string agent)
     {
+        string agentClean = string.IsNullOrWhiteSpace(agent) ? I18n.T("AI agent", "AI-агент") : agent.Trim();
+        string agentId = NormalizeAgentKey(agentClean);
         if (string.IsNullOrWhiteSpace(title))
         {
-            ClearTaskStatus();
+            ClearTaskStatus(agentId);
             return;
         }
-        _taskTitle = title.Trim();
-        _taskCurrent = (current ?? "").Trim();
-        _taskDone = (done ?? Array.Empty<string>()).Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Trim()).Take(10).ToList();
-        _taskNext = (next ?? Array.Empty<string>()).Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Trim()).Take(10).ToList();
-        _taskAgent = (agent ?? "").Trim();
+        var entry = _agentTasks.FirstOrDefault(t => t.AgentId == agentId);
+        if (entry == null)
+        {
+            entry = new AgentTaskState { AgentId = agentId, AgentName = agentClean };
+            _agentTasks.Add(entry);
+        }
+        entry.AgentName = agentClean;
+        entry.Title = title.Trim();
+        entry.Current = (current ?? "").Trim();
+        entry.Done = (done ?? Array.Empty<string>()).Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Trim()).Take(10).ToList();
+        entry.Next = (next ?? Array.Empty<string>()).Where(s => !string.IsNullOrWhiteSpace(s)).Select(s => s.Trim()).Take(10).ToList();
+        string prevStatus = entry.Status;
+        bool autoDone = entry.Next.Count == 0 &&
+            (Regex.IsMatch(entry.Current, @"^(готово|выполнено|завершено|done|completed|finished)\b", RegexOptions.IgnoreCase) ||
+             Regex.IsMatch(entry.Title, @"^(готово|выполнено|завершено|done|completed|finished)\b", RegexOptions.IgnoreCase));
+        entry.Status = autoDone ? "done" : "running";
+        if (entry.Status == "done") entry.CompletedAt ??= DateTime.Now;
+        else entry.CompletedAt = null;
         DateTime? parsed = null;
         if (DateTime.TryParse(startedAt, null, System.Globalization.DateTimeStyles.RoundtripKind, out var st))
             parsed = st.Kind == DateTimeKind.Utc ? st.ToLocalTime() : st;
-        _taskStartedAt = parsed;
-        _taskUpdatedAt = DateTime.Now;
-        Log($"task status: {_taskTitle} — {_taskCurrent}");
+        entry.StartedAt = parsed ?? entry.StartedAt ?? DateTime.Now;
+        entry.UpdatedAt = DateTime.Now;
+        _selectedAgentId = agentId;
+        Log($"task status [{agentClean}] ({entry.Status}): {entry.Title} — {entry.Current}");
+        if (prevStatus != "done" && entry.Status == "done")
+            Telegram.NotifyTaskDone(agentId, entry.AgentName, entry.Title, entry.Current, entry.Done.Count, entry.CompletedAt);
         UpdateStatusText();
     }
 
-    internal void ClearTaskStatus()
+    internal void ClearTaskStatus(string? specificAgentId = null)
     {
-        _taskTitle = "";
-        _taskCurrent = "";
-        _taskDone = new List<string>();
-        _taskNext = new List<string>();
-        _taskAgent = "";
-        _taskStartedAt = null;
+        string targetId = string.IsNullOrWhiteSpace(specificAgentId) ? SelectedAgentId : specificAgentId;
+        if (!string.IsNullOrWhiteSpace(targetId))
+        {
+            var entry = _agentTasks.FirstOrDefault(t => t.AgentId == targetId);
+            if (entry != null)
+            {
+                entry.Title = "";
+                entry.Current = "";
+                entry.Done.Clear();
+                entry.Next.Clear();
+                entry.StartedAt = null;
+            }
+            _ = ClearAgentTaskOnServerAsync(targetId);
+        }
+        else
+        {
+            foreach (var t in _agentTasks)
+            {
+                t.Title = "";
+                t.Current = "";
+                t.Done.Clear();
+                t.Next.Clear();
+                t.StartedAt = null;
+            }
+            _ = ClearAgentTaskOnServerAsync("");
+        }
+        var nextActive = _agentTasks.Where(t => !string.IsNullOrWhiteSpace(t.Title)).OrderByDescending(t => t.UpdatedAt).FirstOrDefault();
+        _selectedAgentId = nextActive?.AgentId ?? "";
         UpdateStatusText();
+    }
+
+    public async Task<bool> SendOwnerMessageAsync(string to, string text, bool stopCommand)
+    {
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{_cfg.Port}/local/owner-message");
+            if (!string.IsNullOrEmpty(_cfg.ControlSecret))
+                req.Headers.Add("X-ZeroIDE-Control", _cfg.ControlSecret);
+            string body = JsonSerializer.Serialize(new { to = string.IsNullOrWhiteSpace(to) ? "*" : to, text, stopCommand });
+            req.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+            using var res = await _http.SendAsync(req);
+            Log($"owner message sent (to={to}, stop={stopCommand}): {res.StatusCode}");
+            return res.IsSuccessStatusCode;
+        }
+        catch (Exception ex)
+        {
+            Log("owner message error: " + ex.Message);
+            return false;
+        }
+    }
+
+    public async Task CancelOwnerMessageAsync(string id = "")
+    {
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{_cfg.Port}/local/owner-message/cancel");
+            if (!string.IsNullOrEmpty(_cfg.ControlSecret))
+                req.Headers.Add("X-ZeroIDE-Control", _cfg.ControlSecret);
+            string body = JsonSerializer.Serialize(new { id });
+            req.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+            using var res = await _http.SendAsync(req);
+        }
+        catch { }
+    }
+
+    private async Task ClearAgentTaskOnServerAsync(string agentId)
+    {
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{_cfg.Port}/local/agent-task/clear");
+            if (!string.IsNullOrEmpty(_cfg.ControlSecret))
+                req.Headers.Add("X-ZeroIDE-Control", _cfg.ControlSecret);
+            string body = JsonSerializer.Serialize(new { agentId });
+            req.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+            using var res = await _http.SendAsync(req);
+        }
+        catch { }
+    }
+
+    public async Task ReleaseStandbyAsync(string agentId = "")
+    {
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{_cfg.Port}/local/standby/release");
+            if (!string.IsNullOrEmpty(_cfg.ControlSecret))
+                req.Headers.Add("X-ZeroIDE-Control", _cfg.ControlSecret);
+            string body = JsonSerializer.Serialize(new { agentId });
+            req.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+            using var res = await _http.SendAsync(req);
+            foreach (var a in _agentTasks)
+            {
+                if (string.IsNullOrEmpty(agentId) || a.AgentId == agentId)
+                    a.StandbyRemainingSec = 0;
+            }
+        }
+        catch { }
+    }
+
+    public async Task SetHoldAfterTaskAsync(bool enabled)
+    {
+        if (enabled && !StandbyToolEnabled) enabled = false;
+        _holdAfterTask = enabled;
+        try
+        {
+            using var req = new HttpRequestMessage(HttpMethod.Post, $"http://127.0.0.1:{_cfg.Port}/local/hold-after-task");
+            if (!string.IsNullOrEmpty(_cfg.ControlSecret))
+                req.Headers.Add("X-ZeroIDE-Control", _cfg.ControlSecret);
+            string body = JsonSerializer.Serialize(new { enabled });
+            req.Content = new StringContent(body, System.Text.Encoding.UTF8, "application/json");
+            using var res = await _http.SendAsync(req);
+            Log($"hold after task: {enabled} ({res.StatusCode})");
+        }
+        catch { }
     }
 
     public void ShowTrayPopup(string mode)
@@ -506,7 +775,7 @@ internal sealed partial class TrayContext : ApplicationContext
 
     public void ApplyTrayMenuMode(string mode)
     {
-        _cfg.TrayMenuMode = string.IsNullOrWhiteSpace(mode) ? "classic" : mode.ToLowerInvariant();
+        _cfg.TrayMenuMode = string.IsNullOrWhiteSpace(mode) ? "panel" : mode.ToLowerInvariant();
         SaveConfig();
         _icon.ContextMenuStrip = _cfg.TrayMenuMode == "classic" ? _classicMenu : null;
     }
@@ -613,6 +882,10 @@ internal sealed partial class TrayContext : ApplicationContext
 
     public string GetLogDirPath() => LogDirPath;
 
+    /// <summary>v0.5 change history: the server keeps previous versions here (index.jsonl + copies),
+    /// Settings → Changes restores them and records the owner's own undo in owner.jsonl.</summary>
+    internal string HistoryDirPath => Path.Combine(Path.GetDirectoryName(Path.GetFullPath(LogDirPath).TrimEnd('\\', '/')) ?? AppContext.BaseDirectory, "history");
+
     public void OpenLogsFolderFromUi()
     {
         Log("opening logs folder: " + LogDirPath);
@@ -669,6 +942,7 @@ internal sealed partial class TrayContext : ApplicationContext
         menu.Items.Add(settingsItem);
         menu.Items.Add(I18n.T("Tools and permissions…", "Инструменты и права…"), null, (_, _) => OpenSettingsWindow("tools"));
         menu.Items.Add(I18n.T("Access (tokens and OAuth)…", "Доступ (токены и OAuth)…"), null, (_, _) => OpenSettingsWindow("access"));
+        menu.Items.Add(I18n.T("Agent changes (undo)…", "Изменения агентов (отмена)…"), null, (_, _) => OpenSettingsWindow("changes"));
 
         _notifyItem.CheckOnClick = true;
         _notifyItem.Checked = _cfg.NotificationsEnabled;
@@ -765,6 +1039,7 @@ internal sealed partial class TrayContext : ApplicationContext
     {
         Log($"approval requested [{req.Tool}] id={req.Id} note={req.Note}");
         TriggerBlink();
+        if (!isDemo) Telegram.NotifyApproval(req);
         return ApprovalToastManager.ShowApprovalAsync(
             req,
             _cfg.DefaultGrantMinutes,
@@ -816,6 +1091,91 @@ internal sealed partial class TrayContext : ApplicationContext
         {
             Log("demo cards error: " + ex.Message);
         }
+    }
+
+    public void OpenTelegramSettingsFromUi(IWin32Window? owner = null)
+    {
+        try
+        {
+            using var dlg = new TelegramSettingsDialog(Telegram);
+            if (owner != null) dlg.ShowDialog(owner);
+            else dlg.ShowDialog();
+        }
+        catch (Exception ex) { Log("telegram settings error: " + ex.Message); }
+    }
+
+    public void CheckForUpdatesFromUi()
+    {
+        if (Updater.State.Latest?.IsDemo == true)
+        {
+            Updater.SetStateForPreview(AppUpdater.CreateDemoUpdateSnapshot());
+            return;
+        }
+        _ = Updater.CheckAsync(_cfg.AutoUpdateEnabled, userInitiated: true);
+    }
+
+    public void InstallUpdateFromUi(IWin32Window? owner = null)
+    {
+        var st = Updater.State;
+        if (st.Latest == null || !AppUpdater.IsNewerVersion(st.Latest.Version, AppUpdater.CurrentVersion))
+            return;
+
+        if (st.Latest.IsDemo)
+        {
+            _ = Updater.RunDemoInstallAnimationAsync();
+            return;
+        }
+
+        if (_state == "on" || _state == "starting")
+        {
+            string msg = I18n.Format(
+                "The MCP server is currently active. Stop the server and install ZeroIDE MCP {0} now?\n\nYour settings, tokens, permissions and change history will be preserved.",
+                "MCP-сервер сейчас активен. Остановить сервер и установить ZeroIDE MCP {0} сейчас?\n\nНастройки, токены, права и история изменений сохранятся.",
+                st.Latest.Tag);
+            var answer = owner != null
+                ? MessageBox.Show(owner, msg, Theme.ProductName, MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2)
+                : MessageBox.Show(msg, Theme.ProductName, MessageBoxButtons.YesNo, MessageBoxIcon.Question, MessageBoxDefaultButton.Button2);
+            if (answer != DialogResult.Yes) return;
+            StopAll("update");
+        }
+
+        _ = Updater.DownloadAndInstallNowAsync();
+    }
+
+    public void OpenUpdateNotesFromUi(IWin32Window? owner = null)
+    {
+        var rel = Updater.State.Latest;
+        if (rel != null && !string.IsNullOrWhiteSpace(rel.ReleaseNotes))
+        {
+            bool canInstall = Updater.State.HasUpdate && Updater.State.Stage is not (UpdateStage.Downloading or UpdateStage.Installing);
+            using var dlg = new UpdateNotesDialog(rel, AppUpdater.CurrentVersion, showInstallButton: canInstall);
+            var res = owner != null ? dlg.ShowDialog(owner) : dlg.ShowDialog();
+            if (res == DialogResult.Yes) InstallUpdateFromUi(owner);
+            return;
+        }
+        OpenReleasesPageFromUi();
+    }
+
+    public void SetCheckUpdatesEnabledFromUi(bool on)
+    {
+        _cfg.CheckUpdatesEnabled = on;
+        SaveConfig();
+    }
+
+    public void SetAutoUpdateEnabledFromUi(bool on)
+    {
+        _cfg.AutoUpdateEnabled = on;
+        SaveConfig();
+        if (on && _state != "on" && _state != "starting" && _updater != null)
+        {
+            _ = _updater.TryAutoApplyAfterServerStopAsync(true);
+        }
+    }
+
+    public void OpenReleasesPageFromUi()
+    {
+        string url = Updater.State.Latest?.HtmlUrl ?? AppUpdater.ReleasesPageUrl;
+        DesktopLauncher.OpenUrl(url);
     }
 
     public void ExitFromUi() => ExitTray();
@@ -933,6 +1293,8 @@ internal sealed partial class TrayContext : ApplicationContext
                 f.RenderPreviewToFile(Path.Combine(outDir, "settings-approvals-2026-10-24.png"), "approvals");
                 f.RenderPreviewToFile(Path.Combine(outDir, "settings-notifications-2026-10-24.png"), "notifications");
                 f.RenderPreviewToFile(Path.Combine(outDir, "settings-about-2026-10-24.png"), "about");
+                f.SetChangesForPreview(ChangeHistory.PreviewSamples(DateTimeOffset.Now, I18n.IsRu));
+                f.RenderPreviewToFile(Path.Combine(outDir, "settings-changes.png"), "changes");
             }
 
             // 1b. OAuth 2.1 Consent Cards (known site + unknown site with amber warning)
@@ -1429,6 +1791,7 @@ internal sealed partial class TrayContext : ApplicationContext
         if (!string.IsNullOrWhiteSpace(_cfg.ProjectDir)) psi.Environment["PROJECT_DIR"] = _cfg.ProjectDir;
         if (!string.IsNullOrWhiteSpace(_cfg.LogDir)) psi.Environment["MCP_LOG_DIR"] = _cfg.LogDir;
         psi.Environment["MCP_CONFIG_FILE"] = Path.Combine(_cfg.ServerDir, "config.env");
+        psi.Environment["MCP_HISTORY_DIR"] = HistoryDirPath; // Settings → Changes reads the same folder
         try
         {
             _server = Process.Start(psi);
@@ -1555,6 +1918,11 @@ internal sealed partial class TrayContext : ApplicationContext
 
         SetState("off", I18n.T("Off", "Выключено"));
         Log("stopped: " + reason);
+
+        if (reason != "exit" && reason != "update" && _cfg.AutoUpdateEnabled && _updater != null)
+        {
+            _ = Task.Delay(1200).ContinueWith(_ => _updater.TryAutoApplyAfterServerStopAsync(_cfg.AutoUpdateEnabled), TaskScheduler.Default);
+        }
     }
 
     private void KillTree(Process? proc)
@@ -1781,6 +2149,78 @@ internal sealed partial class TrayContext : ApplicationContext
                         }
                     }
                 }
+
+                if (doc.RootElement.TryGetProperty("activeAgents", out var agArr) && agArr.ValueKind == JsonValueKind.Array)
+                {
+                    foreach (var ag in agArr.EnumerateArray())
+                    {
+                        string agId = ag.TryGetProperty("agentId", out var aiEl) ? (aiEl.GetString() ?? "default") : "default";
+                        string agName = ag.TryGetProperty("agentName", out var anEl) ? (anEl.GetString() ?? agId) : agId;
+                        string agTitle = ag.TryGetProperty("title", out var atEl) ? (atEl.GetString() ?? "") : "";
+                        string agCur = ag.TryGetProperty("current", out var acEl2) ? (acEl2.GetString() ?? "") : "";
+                        string agStatus = ag.TryGetProperty("status", out var asEl) ? (asEl.GetString() ?? "running") : "running";
+                        string agComp = ag.TryGetProperty("completedAt", out var acmEl) ? (acmEl.GetString() ?? "") : "";
+                        int agStandby = ag.TryGetProperty("standbyRemainingSec", out var sbEl) && sbEl.ValueKind == JsonValueKind.Number ? sbEl.GetInt32() : 0;
+                        var entry = _agentTasks.FirstOrDefault(t => t.AgentId == agId);
+                        if (entry == null)
+                        {
+                            entry = new AgentTaskState { AgentId = agId, AgentName = agName };
+                            _agentTasks.Add(entry);
+                        }
+                        string prevAgStatus = entry.Status;
+                        entry.AgentName = agName;
+                        entry.Status = agStatus;
+                        entry.StandbyRemainingSec = agStandby;
+                        if (!string.IsNullOrWhiteSpace(agComp) && DateTime.TryParse(agComp, null, System.Globalization.DateTimeStyles.RoundtripKind, out var cmpDt))
+                            entry.CompletedAt = cmpDt.Kind == DateTimeKind.Utc ? cmpDt.ToLocalTime() : cmpDt;
+                        else if (agStatus == "done" || agStatus == "waiting")
+                            entry.CompletedAt ??= DateTime.Now;
+                        else
+                            entry.CompletedAt = null;
+                        if (!string.IsNullOrWhiteSpace(agTitle) && string.IsNullOrWhiteSpace(entry.Title))
+                        {
+                            entry.Title = agTitle;
+                            entry.Current = agCur;
+                        }
+                        if (prevAgStatus != "done" && agStatus == "done" && !string.IsNullOrWhiteSpace(entry.Title))
+                            Telegram.NotifyTaskDone(agId, entry.AgentName, entry.Title, entry.Current, entry.Done.Count, entry.CompletedAt);
+                    }
+                }
+
+                if (doc.RootElement.TryGetProperty("chatHistory", out var chArr) && chArr.ValueKind == JsonValueKind.Array)
+                {
+                    _chatHistory.Clear();
+                    foreach (var ch in chArr.EnumerateArray())
+                    {
+                        string id = ch.TryGetProperty("id", out var ci) ? (ci.GetString() ?? "") : "";
+                        string role = ch.TryGetProperty("role", out var cr) ? (cr.GetString() ?? "agent") : "agent";
+                        string agent = ch.TryGetProperty("agent", out var ca) ? (ca.GetString() ?? "") : "";
+                        string text = ch.TryGetProperty("text", out var cx) ? (cx.GetString() ?? "") : "";
+                        string status = ch.TryGetProperty("status", out var cs) ? (cs.GetString() ?? "done") : "done";
+                        string ts = ch.TryGetProperty("ts", out var ct) ? (ct.GetString() ?? "") : "";
+                        _chatHistory.Add(new ChatHistoryItem(id, role, agent, text, status, ts));
+                    }
+                }
+
+                if (doc.RootElement.TryGetProperty("holdAfterTask", out var hatEl))
+                {
+                    _holdAfterTask = hatEl.ValueKind == JsonValueKind.True;
+                }
+
+                if (doc.RootElement.TryGetProperty("ownerMessages", out var omArr) && omArr.ValueKind == JsonValueKind.Array)
+                {
+                    _ownerMessages.Clear();
+                    foreach (var om in omArr.EnumerateArray())
+                    {
+                        string id = om.TryGetProperty("id", out var oi) ? (oi.GetString() ?? "") : "";
+                        string to = om.TryGetProperty("to", out var ot) ? (ot.GetString() ?? "*") : "*";
+                        string text = om.TryGetProperty("text", out var ox) ? (ox.GetString() ?? "") : "";
+                        string status = om.TryGetProperty("status", out var os) ? (os.GetString() ?? "queued") : "queued";
+                        string? jobId = om.TryGetProperty("jobId", out var oj) && oj.ValueKind == JsonValueKind.String ? oj.GetString() : null;
+                        string? deliveredTo = om.TryGetProperty("deliveredTo", out var od) && od.ValueKind == JsonValueKind.String ? od.GetString() : null;
+                        _ownerMessages.Add(new OwnerMessageStatusItem(id, to, text, status, jobId, deliveredTo));
+                    }
+                }
             }
         }
         catch (Exception ex)
@@ -1907,8 +2347,8 @@ internal sealed partial class TrayContext : ApplicationContext
         var tip = $"{Theme.ProductName}: {_stateText}{pendingSuffix}{activeSuffix}{suffix}";
         if (!string.IsNullOrEmpty(_userMessageText))
             tip += $" · {_userMessageText}";
-        if (_cfg.ShowTaskStatus && !string.IsNullOrEmpty(_taskTitle))
-            tip += $" · Задача: {_taskTitle}";
+        if (_cfg.ShowTaskStatus && !string.IsNullOrEmpty(TaskTitle))
+            tip += $" · Задача: {TaskTitle}";
         _icon.Text = tip.Length > 63 ? tip[..63] : tip;
     }
 
@@ -1929,6 +2369,7 @@ internal sealed partial class TrayContext : ApplicationContext
     {
         _poll.Stop();
         _blinkTimer.Stop();
+        try { _updateTimer.Stop(); _updateTimer.Dispose(); } catch { }
         _controlServer?.Dispose();
         ApprovalToastManager.DismissAll("user");
         TrayToastManager.DismissAll();
@@ -1938,6 +2379,8 @@ internal sealed partial class TrayContext : ApplicationContext
         StopAll("exit");
         _icon.Visible = false;
         _icon.Dispose();
+        _updater?.Dispose();
+        _telegram?.Dispose();
         _http.Dispose();
         Application.Exit();
     }
@@ -1955,6 +2398,39 @@ internal sealed record McpToolEvent(
     int? DurationMs,
     long? StartedAtMs = null,
     string Note = ""
+);
+
+internal sealed class AgentTaskState
+{
+    public string AgentId { get; set; } = "default";
+    public string AgentName { get; set; } = "AI-агент";
+    public string Title { get; set; } = "";
+    public string Current { get; set; } = "";
+    public string Status { get; set; } = "running"; // "running" | "done" | "waiting"
+    public List<string> Done { get; set; } = new();
+    public List<string> Next { get; set; } = new();
+    public DateTime? StartedAt { get; set; }
+    public DateTime? CompletedAt { get; set; }
+    public DateTime UpdatedAt { get; set; } = DateTime.Now;
+    public int StandbyRemainingSec { get; set; } = 0;
+}
+
+internal sealed record OwnerMessageStatusItem(
+    string Id,
+    string To,
+    string Text,
+    string Status,
+    string? JobId,
+    string? DeliveredTo
+);
+
+internal sealed record ChatHistoryItem(
+    string Id,
+    string Role,
+    string Agent,
+    string Text,
+    string Status,
+    string Ts
 );
 
 // ============================================================ Heuristic Humanizer (2-Layer)

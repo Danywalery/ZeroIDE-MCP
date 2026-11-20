@@ -8,14 +8,29 @@ namespace ZeroIDE.Mcp;
 internal sealed class ConnectionDialogButton : Button
 {
     private readonly bool _primary;
-    public ConnectionDialogButton(string text, Action action, bool primary = false)
+    private bool _hover, _pressed;
+    public ConnectionDialogButton(string text, Action action, bool primary = false, int minWidth = 175)
     {
-        Text = text; _primary = primary; AutoSize = false; Height = 38; Width = 215;
+        Text = text; _primary = primary; AutoSize = false; Height = 38;
+        Font = Theme.Font(10, true);
+        Width = Math.Max(minWidth, TextRenderer.MeasureText(text, Font).Width + 38);
         FlatStyle = FlatStyle.Flat; FlatAppearance.BorderSize = 0; Cursor = Cursors.Hand;
+        BackColor = Color.FromArgb(20, 23, 29);
+        SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
         Margin = new Padding(0, 0, 10, 10); AccessibleName = text; Click += (_, _) => action();
+        MouseEnter += (_, _) => { _hover = true; Invalidate(); };
+        MouseLeave += (_, _) => { _hover = false; _pressed = false; Invalidate(); };
+        MouseDown += (_, _) => { _pressed = true; Invalidate(); };
+        MouseUp += (_, _) => { _pressed = false; Invalidate(); };
     }
-    protected override void OnPaint(PaintEventArgs e) => Theme.DrawButton(e.Graphics, new RectangleF(1, 1, Width - 2, Height - 2), Text,
-        _primary ? ButtonKind.Primary : ButtonKind.Secondary, Enabled ? Focused || ClientRectangle.Contains(PointToClient(Cursor.Position)) ? ButtonState.Hover : ButtonState.Normal : ButtonState.Disabled, Theme.Font(10, true));
+    protected override void OnPaint(PaintEventArgs e)
+    {
+        e.Graphics.Clear(Parent?.BackColor ?? Color.FromArgb(20, 23, 29));
+        Theme.PrepareGraphics(e.Graphics);
+        var state = !Enabled ? ButtonState.Disabled : _pressed ? ButtonState.Pressed : (_hover || Focused ? ButtonState.Hover : ButtonState.Normal);
+        Theme.DrawButton(e.Graphics, new RectangleF(2, 2, Width - 4, Height - 4), Text,
+            _primary ? ButtonKind.Primary : ButtonKind.Secondary, state, Font);
+    }
 }
 internal class ConnectionDialogBase : Form
 {
@@ -24,7 +39,7 @@ internal class ConnectionDialogBase : Form
     {
         Text = title; StartPosition = FormStartPosition.CenterParent; ClientSize = new Size(650, height); MinimumSize = new Size(590, 430);
         BackColor = Color.FromArgb(20, 23, 29); ForeColor = Color.FromArgb(240, 242, 248); Font = Theme.Font(10);
-        ShowInTaskbar = true; MaximizeBox = false; MinimizeBox = false;
+        ShowInTaskbar = true; MaximizeBox = false; MinimizeBox = false; Theme.ApplyLogo(this);
         // Owner-facing prompts (key entry, launch consent) come from the control API without an owner window: keep them on top and activated.
         TopMost = true; StartPosition = FormStartPosition.CenterScreen; Shown += (_, _) => { Activate(); BringToFront(); };
         Body = new FlowLayoutPanel { Dock = DockStyle.Fill, FlowDirection = FlowDirection.TopDown, WrapContents = false, AutoScroll = true, Padding = new Padding(24) };

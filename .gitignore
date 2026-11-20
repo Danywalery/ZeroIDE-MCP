@@ -1,5 +1,8 @@
 # Local working data and build outputs — never committed.
 output/
+release-local/
+.studio-qa/
+.archive/
 tray/bin/
 tray/obj/
 tray/build/
@@ -15,6 +18,8 @@ node_modules/
 # on every machine; they must never enter the repository.
 config.env
 tokens.json
+telegram.json
+connection-client.json
 tunnel_key*
 tray-config.json
 

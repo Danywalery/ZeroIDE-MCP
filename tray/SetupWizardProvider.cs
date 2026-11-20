@@ -54,7 +54,23 @@ internal sealed partial class SetupWizardForm
         bool running = false, finished = false;
         Label result = null!, progressTitle = null!; WizardChecklist progress = null!; FlowLayoutPanel actions = null!;
         start = Btn(spec.StartEn, spec.StartRu, () => _ = RunAsync(), ButtonKind.Primary);
-        if (spec.LinkUrl.Length > 0) Row(start, Btn(spec.LinkEn, spec.LinkRu, () => OpenUrl(spec.LinkUrl))); else Row(start);
+        if (spec.LinkUrl.Length > 0)
+        {
+            Row(start, Btn(spec.LinkEn, spec.LinkRu, () =>
+            {
+                if (OpenUrl(spec.LinkUrl))
+                {
+                    if (!running) { result.ForeColor = Theme.SuccessText; result.Text = I18n.T("Opened in your browser: ", "Открыто в браузере: ") + spec.LinkUrl; }
+                }
+                else
+                {
+                    try { Clipboard.SetText(spec.LinkUrl); } catch { }
+                    result.ForeColor = Theme.WarningText;
+                    result.Text = I18n.T("Could not launch browser; the link was copied to the clipboard: ", "Не удалось открыть браузер — ссылка скопирована в буфер: ") + spec.LinkUrl;
+                }
+            }));
+        }
+        else Row(start);
         Small("Start switches MCP on if it is off. Nothing launches without your approval in the app's window.", "«Начать» включит MCP, если он выключен. Ничего не запустится без твоего разрешения в окне приложения.");
         result = Small("", "", Theme.TextPrimary, 8);
         progressTitle = Para("", "", true, bottom: 6); progressTitle.Visible = false;

@@ -31,6 +31,7 @@ internal enum IconKind
     Language, Sound, Menu, Globe, Link, ChevronLeft, ChevronUp, Minus, Search, Info,
     Home,
     Shield, ShieldCheck, Image, Lightbulb, Gauge, Server, User, Sliders, FolderLock,
+    History,
 }
 
 /// <summary>Colour/metric set for toast & approval cards (card style: glass | light | compact | neon).</summary>
@@ -1252,7 +1253,69 @@ internal static class Theme
                 Line(18f, 11f, 18f, 20f);
                 Line(6f, 20f, 18f, 20f);
                 break;
+            case IconKind.History:
+            {
+                // Clock face drawn as an arc that ends in a backwards arrow: "go back to an earlier version".
+                const float r = 8.5f, start = 205f, sweep = 300f;
+                Arc(12f, 12f, r, start, sweep);
+                float a = start * MathF.PI / 180f;
+                float sx = 12f + r * MathF.Cos(a), sy = 12f + r * MathF.Sin(a);
+                ArrowHead(sx, sy, MathF.Sin(a), -MathF.Cos(a), 3.2f, 3f);
+                Poly(12f, 7.5f, 12f, 12f, 15f, 14f);
+                break;
+            }
         }
+    }
+
+    // ------------------------------------------------------------------ logo
+    // The ZeroIDE logo (assets/zeroide-logo.svg, 64-unit grid): dark rounded tile, mint Z, blue dot.
+    private static readonly Color LogoTile = Color.FromArgb(0x10, 0x25, 0x23);
+    private static readonly Color LogoRim = Color.FromArgb(0x40, 0x74, 0x6A);
+    private static readonly Color LogoZ = Color.FromArgb(0x82, 0xEB, 0xC8);
+    private static readonly Color LogoDot = Color.FromArgb(0xB2, 0xCE, 0xF5);
+    private static readonly float[] LogoZPath = { 16, 16, 49, 16, 49, 23, 26, 41, 48, 41, 48, 48, 15, 48, 15, 41, 38, 23, 16, 23 };
+
+    /// <summary>Draws the logo into r (square; the shorter side is used). dot overrides the blue dot, e.g. with a state colour.</summary>
+    public static void DrawLogo(Graphics g, RectangleF r, Color? dot = null)
+    {
+        float size = Math.Min(r.Width, r.Height);
+        if (size <= 0) return;
+        float k = size / 64f, ox = r.X + (r.Width - size) / 2f, oy = r.Y + (r.Height - size) / 2f;
+        RectangleF U(float x, float y, float w, float h) => new(ox + x * k, oy + y * k, w * k, h * k);
+        var saved = g.SmoothingMode;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        FillRound(g, U(2, 2, 60, 60), 14 * k, LogoTile);
+        using (var rim = RoundRect(U(4, 4, 56, 56), 12 * k))
+        using (var pen = new Pen(LogoRim, Math.Max(1f, 2 * k)))
+            g.DrawPath(pen, rim);
+        var pts = new PointF[LogoZPath.Length / 2];
+        for (int i = 0; i < pts.Length; i++) pts[i] = new PointF(ox + LogoZPath[i * 2] * k, oy + LogoZPath[i * 2 + 1] * k);
+        using (var zb = new SolidBrush(LogoZ)) g.FillPolygon(zb, pts);
+        using (var db = new SolidBrush(dot ?? LogoDot)) g.FillEllipse(db, U(45, 44, 8, 8));
+        g.SmoothingMode = saved;
+    }
+
+    private static Icon? _logoIcon;
+    /// <summary>Window/taskbar icon (embedded assets/zeroide-logo.ico). Cached and shared: never Dispose.</summary>
+    public static Icon LogoIcon
+    {
+        get
+        {
+            if (_logoIcon != null) return _logoIcon;
+            try
+            {
+                using var s = typeof(Theme).Assembly.GetManifestResourceStream("ZeroIDE.Logo.ico");
+                if (s != null) return _logoIcon = new Icon(s);
+            }
+            catch (Exception) { }
+            return _logoIcon = MakeTrayIcon(Accent, size: 32);
+        }
+    }
+
+    /// <summary>Gives a ZeroIDE window the logo in its title bar and on the taskbar.</summary>
+    public static void ApplyLogo(Form form)
+    {
+        try { form.Icon = LogoIcon; } catch (Exception) { }
     }
 
     // ------------------------------------------------------------------ tray icon
@@ -1260,36 +1323,44 @@ internal static class Theme
     private static extern bool DestroyIcon(IntPtr hIcon);
 
     /// <summary>
-    /// Rounded-square tray icon filled with stateColor and a bold white 'Z' (polygon path, pixel-aligned at 16px).
-    /// ring = white 1px inner outline (attention / pending state). size: 16 (tray) or 32 (hi-DPI / form icon).
+    /// Tray icon based on the ZeroIDE logo (dark tile, emerald rim, mint Z) with a visible state badge dot.
+    /// ring = bright state-coloured outline (attention / pending / active blink). size: 32 by default for crisp tray DPI scaling.
     /// Handle cleanup: the HICON from GetHicon is copied into a managed Icon (Clone) and destroyed immediately,
     /// so the returned Icon owns its handle — Dispose() the old Icon when you replace NotifyIcon.Icon.
     /// </summary>
-    public static Icon MakeTrayIcon(Color stateColor, bool ring = false, int size = 16)
+    public static Icon MakeTrayIcon(Color stateColor, bool ring = false, int size = 32)
     {
         size = Math.Clamp(size, 16, 256);
-        float k = size / 16f;
+        float k = size / 64f;
         using var bmp = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
         using (var g = Graphics.FromImage(bmp))
         {
             g.SmoothingMode = SmoothingMode.AntiAlias;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
             g.Clear(Color.Transparent);
-            var r = new RectangleF(0, 0, size, size);
-            using (var path = RoundRect(r, 4f * k))
-            using (var brush = new SolidBrush(Color.FromArgb(255, stateColor)))
-            {
-                g.FillPath(brush, path);
-            }
-            if (ring) StrokeRound(g, r, 4f * k, Color.FromArgb(235, 255, 255, 255), Math.Max(1f, k));
 
-            float[] z = { 4, 4, 12, 4, 12, 6, 7, 10, 12, 10, 12, 12, 4, 12, 4, 10, 9, 6, 4, 6 };
-            var pts = new PointF[z.Length / 2];
-            for (int i = 0; i < pts.Length; i++) pts[i] = new PointF(z[i * 2] * k, z[i * 2 + 1] * k);
-            using var zp = new GraphicsPath();
-            zp.AddPolygon(pts);
-            using var wb = new SolidBrush(Color.White);
-            g.FillPath(wb, zp);
+            // Base ZeroIDE logo tile + rim (or state-coloured rim when blinking/awaiting attention)
+            FillRound(g, new RectangleF(2 * k, 2 * k, 60 * k, 60 * k), 14 * k, LogoTile);
+            using (var rimPath = RoundRect(new RectangleF(4 * k, 4 * k, 56 * k, 56 * k), 12 * k))
+            using (var rimPen = new Pen(ring ? Color.FromArgb(245, stateColor) : LogoRim, Math.Max(1.5f, (ring ? 4.5f : 2.5f) * k)))
+            {
+                g.DrawPath(rimPen, rimPath);
+            }
+
+            // Mint 'Z' mark matching LogoZPath
+            var pts = new PointF[LogoZPath.Length / 2];
+            for (int i = 0; i < pts.Length; i++)
+                pts[i] = new PointF(LogoZPath[i * 2] * k, LogoZPath[i * 2 + 1] * k);
+            using (var zb = new SolidBrush(LogoZ))
+                g.FillPolygon(zb, pts);
+
+            // State dot in the bottom-right corner with a crisp dark cutout so status stays readable at 16px
+            var cutout = new RectangleF(40 * k, 39 * k, 18 * k, 18 * k);
+            using (var cutBrush = new SolidBrush(LogoTile))
+                g.FillEllipse(cutBrush, cutout);
+            var dotRect = new RectangleF(42.5f * k, 41.5f * k, 13 * k, 13 * k);
+            using (var db = new SolidBrush(Color.FromArgb(255, stateColor)))
+                g.FillEllipse(db, dotRect);
         }
         IntPtr h = bmp.GetHicon();
         try

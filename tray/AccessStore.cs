@@ -592,6 +592,7 @@ internal sealed class CreateTokenDialog : Form
 
     public CreateTokenDialog(string defaultProjectDir)
     {
+        Theme.ApplyLogo(this);
         Text = I18n.Format("Create access token — {0}", "Создать токен доступа — {0}", Theme.ProductName);
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.CenterParent;
@@ -726,6 +727,7 @@ internal sealed class ShowTokenOnceDialog : Form
 {
     public ShowTokenOnceDialog(string title, TokenEntry entry, string plaintextToken)
     {
+        Theme.ApplyLogo(this);
         Text = title;
         FormBorderStyle = FormBorderStyle.FixedDialog;
         StartPosition = FormStartPosition.CenterParent;
@@ -845,6 +847,7 @@ internal sealed class MissedRequestsForm : Form
     public MissedRequestsForm(TrayContext ctx)
     {
         _ctx = ctx;
+        Theme.ApplyLogo(this);
         Text = I18n.Format("Missed approval requests — {0}", "Пропущенные запросы подтверждения — {0}", Theme.ProductName);
         FormBorderStyle = FormBorderStyle.None;
         StartPosition = FormStartPosition.CenterScreen;
