@@ -268,7 +268,7 @@ internal static partial class TrayUiTests
 
             PermissionsStore.ApplyRiskToggles(new PermissionsConfig(), highOn: true, criticalOn: true, save: true);
             using var toolsForm = new SettingsForm(FakeTray(Path.Combine(temp, "tools-risk")), "tools");
-            toolsForm.PaintForTests(450);
+            toolsForm.PaintForTests(480);
             Check(toolsForm.ZoneIdsForTests.Contains("toggle_redflags") && toolsForm.ZoneIdsForTests.Contains("toggle_critical_guard"),
                 "Settings -> Tools -> Execution renders both High/Red-Flag and Critical toggles");
 
