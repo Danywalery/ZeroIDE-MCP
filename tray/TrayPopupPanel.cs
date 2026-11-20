@@ -34,6 +34,7 @@ internal sealed class TrayPopupForm : Form
     private string _composerFeedback = "";
     private DateTime _composerFeedbackUntil = DateTime.MinValue;
     private float _scrollY;
+    private float? _previewLogicalHeight;
     private readonly System.Windows.Forms.Timer _refreshTimer = new() { Interval = 900 };
     private readonly UiFrameTimer _motionTimer;
     private readonly UiAnimationClock _motion = new();
@@ -43,7 +44,7 @@ internal sealed class TrayPopupForm : Form
     private static readonly Color TextSec = Theme.TextSecondary;
     private float ScaleFactor => _mode == "mini" ? 1f : Math.Max(1f, DeviceDpi / 96f);
     private float PanelWidth => _recentExpanded ? 580f : 480f;
-    private float LogicalHeight => ClientSize.Height / ScaleFactor;
+    private float LogicalHeight => _previewLogicalHeight ?? (ClientSize.Height / ScaleFactor);
     private bool TaskBlockVisible => _ctx.ShowTaskStatus && !string.IsNullOrWhiteSpace(_ctx.TaskTitle);
     private IReadOnlyList<McpToolEvent> RecentCalls => _ctx.RecentEvents ?? Array.Empty<McpToolEvent>();
 
@@ -349,7 +350,8 @@ internal sealed class TrayPopupForm : Form
             if (_keyboardHitIdx >= 0 && _keyboardHitIdx < _hits.Count)
                 Theme.StrokeRound(logical, RectangleF.Inflate(_hits[_keyboardHitIdx].Rect, 2, 2), 6, Theme.AccentHover, 1.5f);
         }
-        g.DrawImage(canvas, new Rectangle(0, 0, Width, Height), new Rectangle(0, 0, canvas.Width, canvas.Height), GraphicsUnit.Pixel);
+        var dst = _previewLogicalHeight.HasValue ? e.ClipRectangle : new Rectangle(0, 0, Width, Height);
+        g.DrawImage(canvas, dst, new Rectangle(0, 0, canvas.Width, canvas.Height), GraphicsUnit.Pixel);
     }
 
     private Color StateColor() => _ctx.CurrentState == "on" ? Theme.Success : _ctx.CurrentState == "starting" ? Theme.Warning : Theme.TextTertiary;
@@ -1394,12 +1396,22 @@ internal sealed class TrayPopupForm : Form
 
     public void RenderToBitmapFile(string filePath)
     {
-        if (_mode == "panel") Size = new Size((int)(PanelWidth * ScaleFactor), ComputePanelHeight());
-        using var bmp = new Bitmap(Width, Height, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
-        bmp.SetResolution(96, 96); // Logical canvas already applies DeviceDpi explicitly.
-        using var g = Graphics.FromImage(bmp);
-        using var pe = new PaintEventArgs(g, new Rectangle(Point.Empty, Size));
-        OnPaint(pe); bmp.Save(filePath, System.Drawing.Imaging.ImageFormat.Png);
+        int w = _mode == "panel" ? (int)Math.Round(PanelWidth * ScaleFactor) : Width;
+        int h = _mode == "panel" ? UnclampedPanelHeightForTest : Height;
+        _previewLogicalHeight = _mode == "panel" ? (132f + BodyHeight()) : null;
+        try
+        {
+            using var bmp = new Bitmap(Math.Max(1, w), Math.Max(1, h), System.Drawing.Imaging.PixelFormat.Format32bppArgb);
+            bmp.SetResolution(96, 96); // Logical canvas already applies DeviceDpi explicitly.
+            using var g = Graphics.FromImage(bmp);
+            using var pe = new PaintEventArgs(g, new Rectangle(0, 0, bmp.Width, bmp.Height));
+            OnPaint(pe);
+            bmp.Save(filePath, System.Drawing.Imaging.ImageFormat.Png);
+        }
+        finally
+        {
+            _previewLogicalHeight = null;
+        }
     }
 
     private void DrawToggle(Graphics g, float x, float y, bool isOn, Action onClick)
