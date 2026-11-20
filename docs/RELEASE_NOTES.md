@@ -33,7 +33,7 @@ Success means a real connection from your AI client, not only a passing local ch
 
 ## Tests
 
-The release build reruns all 10 automated suites (562 checks): connection registry, CLI, installer and package contract, tray connection runtime, onboarding helpers, isolated server checks, security checks, the v0.4 suites (folder confinement, token scopes and limits, rotation and revocation, client registration policy, OAuth flow), the v0.5 guardian suite (self-protection, risk ratings & autonomy toggles, change history and undo, new file tools) and the tray UI suite (tray panel chat/task card, approval cards, risk toggles, Settings → Changes & diff compare dialog, Telegram alerts, GitHub auto-updater).
+The release build reruns all 10 automated suites (563 checks): connection registry, CLI, installer and package contract, tray connection runtime, onboarding helpers, isolated server checks, security checks, the v0.4 suites (folder confinement, token scopes and limits, rotation and revocation, client registration policy, OAuth flow), the v0.5 guardian suite (self-protection, risk ratings & autonomy toggles, change history and undo, new file tools) and the tray UI suite (tray panel chat/task card, approval cards, risk toggles, Settings → Changes & diff compare dialog, Telegram alerts, GitHub auto-updater).
 
 ## Known limits
 

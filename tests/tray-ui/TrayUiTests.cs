@@ -138,7 +138,7 @@ internal static partial class TrayUiTests
         {
             string cFile = Path.Combine(temp, "panel-task-collapsed.png");
             collapsedPanel.RenderToBitmapFile(cFile);
-            collapsedBannerHeight = collapsedPanel.Height;
+            collapsedBannerHeight = collapsedPanel.UnclampedPanelHeightForTest;
             Check(!collapsedPanel.CurrentTipsForTest.Any(t => t.Tip.StartsWith("monday agent: Принял", StringComparison.Ordinal)), "collapsed chat hides dialogue bubbles completely");
             using var cBmp = new Bitmap(cFile);
             Save(cBmp, "tray-panel-task-collapsed-ru");
@@ -151,7 +151,7 @@ internal static partial class TrayUiTests
             expandedPanel.SetTaskExpandedForPreview(true);
             string eFile = Path.Combine(temp, "panel-task-expanded.png");
             expandedPanel.RenderToBitmapFile(eFile);
-            Check(expandedPanel.Height > collapsedBannerHeight + 60, "expanding long message banner and task card shows full content");
+            Check(expandedPanel.UnclampedPanelHeightForTest > collapsedBannerHeight + 60, "expanding long message banner and task card shows full content");
             using var eBmp = new Bitmap(eFile);
             Save(eBmp, "tray-panel-task-expanded-ru");
         }
@@ -177,7 +177,7 @@ internal static partial class TrayUiTests
             chatPanel.SetComposerForPreview(true, "После проверки сохрани скриншот в папку отчётов");
             string chatFile = Path.Combine(temp, "panel-chat.png");
             chatPanel.RenderToBitmapFile(chatFile);
-            chatHeightCollapsedBubble = chatPanel.Height;
+            chatHeightCollapsedBubble = chatPanel.UnclampedPanelHeightForTest;
             Check(chatPanel.CurrentTipsForTest.Any(t => t.Tip.Contains("не разрывает соединение", StringComparison.OrdinalIgnoreCase)), "expanded chat keeps explanatory tooltip on the 5-min button");
             using var chatBmp = new Bitmap(chatFile);
             Save(chatBmp, "tray-panel-chat-open-ru");
@@ -188,7 +188,7 @@ internal static partial class TrayUiTests
             fullBubblePanel.SetChatBubbleExpandedForPreview("m2", true);
             string fullFile = Path.Combine(temp, "panel-chat-full.png");
             fullBubblePanel.RenderToBitmapFile(fullFile);
-            Check(fullBubblePanel.Height > chatHeightCollapsedBubble, "clicking a long chat bubble expands the full model answer");
+            Check(fullBubblePanel.UnclampedPanelHeightForTest > chatHeightCollapsedBubble, "clicking a long chat bubble expands the full model answer");
             using var fullBmp = new Bitmap(fullFile);
             Save(fullBmp, "tray-panel-chat-expanded-ru");
         }
@@ -276,6 +276,12 @@ internal static partial class TrayUiTests
             string execPng = Path.Combine(temp, "settings-tools-exec-ru.png");
             toolsForm.RenderPreviewToFile(execPng, "tools", scrollY: 450);
             using (var eb = new Bitmap(execPng)) Save(eb, "settings-tools-exec-ru");
+
+            // Also confirm small runner screens keep Execution toggles reachable when scrolled
+            toolsForm.Size = new Size(1000, 680);
+            toolsForm.PaintForTests(480);
+            Check(toolsForm.ZoneIdsForTests.Contains("toggle_redflags") && toolsForm.ZoneIdsForTests.Contains("toggle_critical_guard"),
+                "can inspect High/Red-Flag and Critical toggles on compact screens too");
 
             Check(toolsForm.InvokeZoneForTests("toggle_redflags"), "can click High/Red-Flag toggle in Settings");
             var afterHighOff = PermissionsStore.Load();
@@ -491,9 +497,15 @@ internal static partial class TrayUiTests
 
             settingsHome.PaintForTests();
             var aboutZones = settingsHome.ZoneIdsForTests;
+            if (!aboutZones.Contains("abt_upd_auto_toggle"))
+            {
+                settingsHome.PaintForTests(120);
+                aboutZones = settingsHome.ZoneIdsForTests;
+            }
             Check(aboutZones.Contains("abt_upd_install") && aboutZones.Contains("abt_upd_check") && aboutZones.Contains("abt_upd_notes") && aboutZones.Contains("abt_upd_check_toggle") && aboutZones.Contains("abt_upd_auto_toggle"),
                 "Settings -> About shows update status, Install/Check/What's new buttons and both update toggles");
-            if (!aboutZones.Contains("abt_contact_tg")) settingsHome.PaintForTests(200);
+            settingsHome.Size = new Size(1000, 680);
+            settingsHome.PaintForTests(240);
             Check(settingsHome.ZoneIdsForTests.Contains("abt_contact_tg"), "Settings -> About shows Telegram @danywalery contact link");
 
             settingsHome.NavigateToSection("home");

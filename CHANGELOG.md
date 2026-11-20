@@ -30,7 +30,7 @@
 - **Modern default tray & clearer controls:** `TrayMenuMode` defaults to `"panel"`; all 19 server tools appear in Settings → Tools; clicking the local status banner button opens the setup wizard directly on the internet/ngrok step.
 - **Reliable desktop launching (`DesktopLauncher`):** opening provider key pages, **Show in folder** (including spaces, Cyrillic paths and deleted-file parent folder fallback), agent message **Open** links, screenshot folder and dashboard links now explicitly target the interactive desktop (`winsta0\default`); added a working **Open key page** button directly inside the TopMost secret entry dialog.
 - **Installer & testability:** `installer/install.ps1` adds `-InstallDir` support and migrates `telegram.json`; `ZEROIDE_INSTANCE_ID` supports isolated side-by-side tray instances; `/approval/simulate-click` works only when `ZEROIDE_TEST_SIMULATE_CLICK=1`.
-- **One version & expanded CI coverage:** aligned to `0.5.0` everywhere; automated test suite expanded to 10 suites / 562 checks (`guardian-v05.mjs` 79 checks, `TrayUiTests` 118 checks, `RuntimeTests` 80 checks, plus `server-proof`, `security-v04`, `isolated-v04`, `connections-v2`, `cli-smoke`, `installer-smoke`, and `onboarding-helpers`).
+- **One version & expanded CI coverage:** aligned to `0.5.0` everywhere; automated test suite expanded to 10 suites / 563 checks (`guardian-v05.mjs` 79 checks, `TrayUiTests` 119 checks, `RuntimeTests` 80 checks, plus `server-proof`, `security-v04`, `isolated-v04`, `connections-v2`, `cli-smoke`, `installer-smoke`, and `onboarding-helpers`).
 
 ## 0.4.0 — 2026-11-15
 

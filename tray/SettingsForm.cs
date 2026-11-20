@@ -121,7 +121,8 @@ internal sealed partial class SettingsForm : Form
         DoubleBuffered = true;
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
 
-        MaximumSize = Screen.FromPoint(Cursor.Position).WorkingArea.Size;
+        var wa = Screen.FromPoint(Cursor.Position).WorkingArea.Size;
+        MaximumSize = new Size(Math.Max(MinimumSize.Width, wa.Width), Math.Max(MinimumSize.Height, wa.Height));
         LoadAuditItems();
         _ = RefreshGrantsAsync();
 

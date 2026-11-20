@@ -149,6 +149,8 @@ internal sealed class TrayPopupForm : Form
         return Math.Min((int)Math.Ceiling((132f + BodyHeight()) * ScaleFactor), max);
     }
 
+    internal int UnclampedPanelHeightForTest => (int)Math.Ceiling((132f + BodyHeight()) * ScaleFactor);
+
     private void ReflowPanel()
     {
         if (_mode == "mini") return;
