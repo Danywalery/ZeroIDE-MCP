@@ -8,9 +8,10 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>ZeroIDE-MCP</AssemblyName>
     <RootNamespace>ZeroIDE.Mcp</RootNamespace>
-    <ApplicationIcon />
-    <Version>0.4.0</Version>
-    <InformationalVersion>0.4.0</InformationalVersion>
+    <!-- The ZeroIDE logo: exe icon in Explorer/taskbar and the icon of every ZeroIDE window. -->
+    <ApplicationIcon>../assets/zeroide-logo.ico</ApplicationIcon>
+    <Version>0.5.0</Version>
+    <InformationalVersion>0.5.0</InformationalVersion>
     <PublishSingleFile>true</PublishSingleFile>
     <SelfContained>true</SelfContained>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
@@ -20,6 +21,7 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <EmbeddedResource Include="../assets/zeroide-logo.ico" LogicalName="ZeroIDE.Logo.ico" />
     <PackageReference Include="System.Management" Version="8.0.0" />
   </ItemGroup>
 

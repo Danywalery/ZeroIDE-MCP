@@ -36,7 +36,7 @@ jobs:
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
-          $names = @('config.env','tray-config.json','tokens.json','oauth.json','connections-v2.json','connection-client.json')
+          $names = @('config.env','tray-config.json','tokens.json','oauth.json','telegram.json','connections-v2.json','connection-client.json')
           $hits = @(git ls-files | Where-Object { $leaf = Split-Path $_ -Leaf; $leaf -in $names -or $leaf -like '*.token' -or $leaf -like 'tunnel_key*' })
           if ($hits.Count) { throw ("Machine-local state is tracked: " + ($hits -join ', ')) }
           "No machine-local state tracked"
@@ -79,6 +79,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw "Server security tests failed" }
           node tests/isolated-v04.mjs
           if ($LASTEXITCODE -ne 0) { throw "Older v0.4 server suites failed" }
+          node tests/guardian-v05.mjs
+          if ($LASTEXITCODE -ne 0) { throw "v0.5 guardian tests failed" }
 
       - name: Registry and CLI tests
         shell: powershell
@@ -96,3 +98,5 @@ jobs:
         run: |
           dotnet run --project tests/connections-runtime/RuntimeTests.csproj -c Release -- output/renders
           if ($LASTEXITCODE -ne 0) { throw "Native runtime tests failed" }
+          dotnet run --project tests/tray-ui/TrayUiTests.csproj -c Release -- output/tray-ui
+          if ($LASTEXITCODE -ne 0) { throw "Tray UI tests failed" }

@@ -60,11 +60,45 @@ internal sealed class ConnectionSecretDialog : ConnectionDialogBase
 {
     private readonly TextBox _secret;
     internal string Secret => _secret.Text;
-    public ConnectionSecretDialog(string provider, string reason) : base(I18n.T("Provider key", "Ключ провайдера"), 460)
+    internal string ProviderKeyUrl { get; } = "";
+    internal static (string LabelEn, string LabelRu, string Url) ProviderLink(string provider) => provider.ToLowerInvariant() switch
     {
-        Explanation(provider == "ngrok" ? I18n.T("ngrok key — this is NOT an MCP password", "Ключ ngrok — это НЕ пароль от MCP") : provider + I18n.T(" account key", " · ключ аккаунта"), 40);
-        Explanation(I18n.T("Paste the key from your provider account. It will be saved in a protected local file. Only the file path is returned to the agent.", "Вставь ключ из аккаунта провайдера. Он сохранится в защищённом файле на ПК. Агент получит только путь к файлу."), 74);
-        if (reason.Length > 0) Explanation(reason, 60);
+        "ngrok" => ("Open the ngrok key page", "Открыть страницу с ключом ngrok", "https://dashboard.ngrok.com/get-started/your-authtoken"),
+        "cloudflare" => ("Open Cloudflare Zero Trust", "Открыть Cloudflare Zero Trust", "https://one.dash.cloudflare.com/"),
+        _ => ("", "", ""),
+    };
+    public ConnectionSecretDialog(string provider, string reason) : base(I18n.T("Provider key", "Ключ провайдера"), ProviderLink(provider).Url.Length > 0 ? 520 : 460)
+    {
+        var link = ProviderLink(provider);
+        ProviderKeyUrl = link.Url;
+        Explanation(provider == "ngrok" ? I18n.T("ngrok key — this is NOT an MCP password", "Ключ ngrok — это НЕ пароль от MCP") : provider + I18n.T(" account key", " · ключ аккаунта"), 34);
+        Explanation(I18n.T("Paste the key from your provider account. It will be saved in a protected local file. Only the file path is returned to the agent.", "Вставь ключ из аккаунта провайдера. Он сохранится в защищённом файле на ПК. Агент получит только путь к файлу."), 62);
+        if (reason.Length > 0) Explanation(reason, 48);
+        if (link.Url.Length > 0)
+        {
+            Label linkFeedback = null!;
+            var linkRow = new FlowLayoutPanel { Width = 590, AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, WrapContents = true, Margin = new Padding(0, 0, 0, 8) };
+            linkRow.Controls.Add(new ConnectionDialogButton(I18n.T(link.LabelEn, link.LabelRu), () =>
+            {
+                bool opened = DesktopLauncher.OpenUrl(link.Url);
+                if (opened)
+                {
+                    linkFeedback.ForeColor = Theme.SuccessText;
+                    linkFeedback.Text = I18n.T("Opened in your browser. Copy the key and paste it below.", "Открыто в браузере. Скопируй ключ и вставь его в поле ниже.");
+                }
+                else
+                {
+                    try { Copy(link.Url); } catch { }
+                    linkFeedback.ForeColor = Theme.WarningText;
+                    linkFeedback.Text = I18n.T("Could not launch browser; the link was copied to the clipboard.", "Не удалось открыть браузер — ссылка скопирована в буфер обмена.");
+                }
+                linkFeedback.Visible = true;
+                _secret?.Focus();
+            }, primary: false, minWidth: 260));
+            Body.Controls.Add(linkRow);
+            linkFeedback = new Label { Width = 590, AutoSize = true, MaximumSize = new Size(590, 0), ForeColor = Theme.SuccessText, Visible = false, Margin = new Padding(0, 0, 0, 10) };
+            Body.Controls.Add(linkFeedback);
+        }
         _secret = Field(I18n.T("Key", "Ключ"), ""); _secret.UseSystemPasswordChar = true; _secret.MaxLength = 4096;
         var row = Actions();
         row.Controls.Add(new ConnectionDialogButton(I18n.T("Save key", "Сохранить ключ"), () => { if (!string.IsNullOrWhiteSpace(_secret.Text)) { DialogResult = DialogResult.OK; Close(); } }, true));

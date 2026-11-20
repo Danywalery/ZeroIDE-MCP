@@ -57,7 +57,7 @@ try{
  check(!tested.out.includes(token)&&!tested.err.includes(token)&&!tested.out.includes(secret)&&!tested.err.includes(secret),'real helper never prints local credentials');
  check(tested.code===0&&controlReads===1,'shipped helper authenticates to isolated control API');
  let helperResult;try{helperResult=JSON.parse(tested.out.replace(/^\uFEFF/,''));}catch{throw Error('Local helper did not return JSON');}
- check(helperResult.status==='local_ready'&&helperResult.toolCount===14&&helperResult.sessionClosed===true,'real helper completes initialize, tools/list and session cleanup');
+ check(helperResult.status==='local_ready'&&helperResult.toolCount>=14&&helperResult.sessionClosed===true,'real helper completes initialize, tools/list and session cleanup');
  check(helperResult.clientOnboardingComplete===false&&!fs.existsSync(marker),'real helper cannot manufacture client-onboarding evidence');
  await new Promise(resolve=>control.close(resolve));control=null;
  const h={'Content-Type':'application/json',Accept:'application/json, text/event-stream',Authorization:'Bearer '+token,'X-Forwarded-Host':'client.example.test'};

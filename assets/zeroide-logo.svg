@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="ZeroIDE Studio">
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="#102523"/>
+  <rect x="4" y="4" width="56" height="56" rx="12" fill="none" stroke="#40746a" stroke-width="2"/>
+  <path d="M16 16h33v7L26 41h22v7H15v-7l23-18H16z" fill="#82ebc8"/>
+  <circle cx="49" cy="48" r="4" fill="#b2cef5"/>
+</svg>

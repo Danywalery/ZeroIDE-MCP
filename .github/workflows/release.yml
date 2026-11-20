@@ -1,7 +1,8 @@
 name: Build release
 
 # The repository holds SOURCE ONLY. The installable product is a Release
-# asset: a zip with the prebuilt self-contained tray exe at the package root
+# asset: a zip with one top-level folder, zeroide-mcp/, so extracting it never
+# scatters files; the prebuilt self-contained tray exe sits at that package root
 # (double-click = setup wizard), the server with dependencies preinstalled,
 # and the installer. Nothing is built on the end user's PC: no .NET SDK, no
 # npm install there.
@@ -59,12 +60,16 @@ jobs:
         run: |
           dotnet run --project tests/connections-runtime/RuntimeTests.csproj -c Release -- output/renders
           if ($LASTEXITCODE -ne 0) { throw "Native runtime tests failed" }
+          dotnet run --project tests/tray-ui/TrayUiTests.csproj -c Release -- output/tray-ui
+          if ($LASTEXITCODE -ne 0) { throw "Tray UI tests failed" }
           node tests/connections-runtime/server-proof.mjs
           if ($LASTEXITCODE -ne 0) { throw "Isolated server tests failed" }
           node tests/security-v04.mjs
           if ($LASTEXITCODE -ne 0) { throw "Server security tests failed" }
           node tests/isolated-v04.mjs
           if ($LASTEXITCODE -ne 0) { throw "Older v0.4 server suites failed" }
+          node tests/guardian-v05.mjs
+          if ($LASTEXITCODE -ne 0) { throw "v0.5 guardian tests failed" }
 
       - name: Stage release package
         shell: powershell
@@ -93,13 +98,16 @@ jobs:
           $errors = $null
           [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path staging/installer/install.ps1), [ref]$null, [ref]$errors) | Out-Null
           if ($errors.Count) { throw "Installer has syntax errors" }
-          $forbidden = Get-ChildItem staging -Recurse -File | Where-Object { $_.Name -in @('config.env','tray-config.json','tokens.json','oauth.json','connections-v2.json','connection-client.json') -or $_.Name -like '*.token' -or $_.Name -like 'tunnel_key*' }
+          $forbidden = Get-ChildItem staging -Recurse -File | Where-Object { $_.Name -in @('config.env','tray-config.json','tokens.json','oauth.json','telegram.json','connections-v2.json','connection-client.json') -or $_.Name -like '*.token' -or $_.Name -like 'tunnel_key*' }
           if ($forbidden) { throw "Machine-local state found in package" }
 
       - name: Pack zip
         shell: powershell
         run: |
-          Compress-Archive -Path staging/* -DestinationPath zeroide-mcp.zip
+          # One top-level folder inside the zip: "Extract all" produces zeroide-mcp\ with everything in it.
+          New-Item -ItemType Directory -Force -Path pack | Out-Null
+          Move-Item staging pack/zeroide-mcp
+          Compress-Archive -Path pack/zeroide-mcp -DestinationPath zeroide-mcp.zip
           $hash = (Get-FileHash zeroide-mcp.zip -Algorithm SHA256).Hash.ToLowerInvariant()
           "$hash  zeroide-mcp.zip" | Set-Content zeroide-mcp.zip.sha256 -Encoding ASCII
 

@@ -89,6 +89,54 @@ public sealed class ApprovalRequestDto
 
     [JsonPropertyName("description")]
     public string? Description { get; set; }
+
+    // v0.5: which agent slot asks, the server's risk reading and a preview of the change.
+    [JsonPropertyName("agent")]
+    public string? Agent { get; set; }
+
+    [JsonPropertyName("assessment")]
+    public ApprovalAssessmentDto? Assessment { get; set; }
+
+    [JsonPropertyName("preview")]
+    public ApprovalPreviewDto? Preview { get; set; }
+}
+
+/// <summary>Server-side risk reading shown on the card (v0.5).</summary>
+public sealed class ApprovalAssessmentDto
+{
+    [JsonPropertyName("level")]
+    public string Level { get; set; } = "low"; // low | medium | high | critical
+
+    [JsonPropertyName("headline")]
+    public string Headline { get; set; } = "";
+
+    [JsonPropertyName("reasons")]
+    public List<string> Reasons { get; set; } = new();
+
+    // "rule" = an allow rule was escalated, "grant" = a temporary grant did not cover it,
+    // "redflag" = a dangerous-command pattern from permissions.json matched.
+    [JsonPropertyName("escalated")]
+    public string? Escalated { get; set; }
+
+    // false for critical calls: the card must not offer a temporary grant.
+    [JsonPropertyName("grantable")]
+    public bool Grantable { get; set; } = true;
+}
+
+/// <summary>What a write or an edit changes: line counts and a compact diff (v0.5).</summary>
+public sealed class ApprovalPreviewDto
+{
+    [JsonPropertyName("exists")]
+    public bool Exists { get; set; }
+
+    [JsonPropertyName("added")]
+    public int Added { get; set; }
+
+    [JsonPropertyName("removed")]
+    public int Removed { get; set; }
+
+    [JsonPropertyName("text")]
+    public string Text { get; set; } = "";
 }
 
 public sealed class ApprovalResponseDto
@@ -118,6 +166,47 @@ public sealed class ApprovalResponseDto
 
     [JsonPropertyName("by")]
     public string By { get; set; } = "user";
+}
+
+/// <summary>
+/// One-click link attached to an agent message (v0.5 user_message.open). The tray re-checks
+/// everything itself: only http(s) links, existing local files and folders; programs,
+/// scripts and shortcuts are only ever revealed in Explorer, never launched.
+/// </summary>
+public sealed record MessageLink(string Kind, string Target, bool Reveal)
+{
+    private static readonly System.Text.RegularExpressions.Regex RevealOnly = new(
+        @"\.(exe|com|bat|cmd|ps1|psm1|vbs|vbe|js|jse|wsf|wsh|hta|msi|msp|scr|lnk|reg|cpl|jar|appref-ms|url|pif|application|gadget|msc|dll|sys)$",
+        System.Text.RegularExpressions.RegexOptions.IgnoreCase | System.Text.RegularExpressions.RegexOptions.CultureInvariant);
+
+    public static MessageLink? TryCreate(string kind, string target, bool reveal)
+    {
+        target = (target ?? "").Trim();
+        if (target.Length == 0 || target.Length > 2048) return null;
+        if (kind == "url")
+            return Uri.TryCreate(target, UriKind.Absolute, out var u) && (u.Scheme == Uri.UriSchemeHttps || u.Scheme == Uri.UriSchemeHttp) ? new MessageLink("url", u.AbsoluteUri, false) : null;
+        if (kind != "file" && kind != "folder") return null;
+        if (target.StartsWith(@"\\", StringComparison.Ordinal) || target.StartsWith("//", StringComparison.Ordinal) || !Path.IsPathFullyQualified(target)) return null;
+        return new MessageLink(kind, target, kind == "file" && (reveal || RevealOnly.IsMatch(target)));
+    }
+
+    public string ButtonText => Kind == "url" ? I18n.T("Open link", "Открыть ссылку")
+        : Kind == "folder" ? I18n.T("Open folder", "Открыть папку")
+        : Reveal ? I18n.T("Show in folder", "Показать в папке") : I18n.T("Open", "Открыть");
+
+    /// <summary>Opens the link; returns false when the target no longer exists or cannot be opened.</summary>
+    public bool Open()
+    {
+        try
+        {
+            if (Kind == "url") return DesktopLauncher.OpenUrl(Target);
+            if (Kind == "folder") return DesktopLauncher.OpenExistingFolder(Target);
+            if (!File.Exists(Target)) return false;
+            if (Reveal || RevealOnly.IsMatch(Target)) return DesktopLauncher.RevealInFolder(Target);
+            return DesktopLauncher.OpenDocument(Target);
+        }
+        catch { return false; }
+    }
 }
 
 public sealed class SimulateClickDto
@@ -218,6 +307,7 @@ internal sealed class ApprovalControlServer : IDisposable
     private readonly Action<string, string, string[], string[], string, string>? _onTaskStatus;
     private readonly Func<string>? _getState;
     private readonly Func<string, string, string, Task<(int, string)>>? _onConnection;
+    private readonly Action<string, string, MessageLink?>? _onMessageDetails;
     private TcpListener? _listener;
     private CancellationTokenSource? _cts;
 
@@ -230,8 +320,10 @@ internal sealed class ApprovalControlServer : IDisposable
         Action<string, string, bool, string>? onMessage = null,
         Func<string>? getState = null,
         Action<string, string, string[], string[], string, string>? onTaskStatus = null,
-        Func<string, string, string, Task<(int, string)>>? onConnection = null)
+        Func<string, string, string, Task<(int, string)>>? onConnection = null,
+        Action<string, string, MessageLink?>? onMessageDetails = null)
     {
+        _onMessageDetails = onMessageDetails;
         _port = port;
         _getSecret = getSecret;
         _uiCtx = uiCtx;
@@ -389,6 +481,14 @@ internal sealed class ApprovalControlServer : IDisposable
 
                 if (method == "POST" && path == "/approval/simulate-click")
                 {
+                    // v0.5: an approval must come from a human click. This debug hook let
+                    // anything that knew the control secret approve its own card, so it is
+                    // now off unless a test harness explicitly opts in for this process.
+                    if (Environment.GetEnvironmentVariable("ZEROIDE_TEST_SIMULATE_CLICK") != "1")
+                    {
+                        await WriteJsonResponseAsync(stream, 404, "{\"error\":\"not_found\"}", ct);
+                        return;
+                    }
                     bool hasLifetimeProp = false;
                     try
                     {
@@ -424,7 +524,17 @@ internal sealed class ApprovalControlServer : IDisposable
                         string mKind = msgRoot.TryGetProperty("kind", out var mk) ? (mk.GetString() ?? "status") : "status";
                         bool mPersistent = !msgRoot.TryGetProperty("persistent", out var mp) || mp.GetBoolean();
                         string mId = msgRoot.TryGetProperty("id", out var mi) ? (mi.GetString() ?? "") : "";
+                        string mAgent = msgRoot.TryGetProperty("agent", out var ma) && ma.ValueKind == JsonValueKind.String ? (ma.GetString() ?? "") : "";
+                        MessageLink? mLink = null;
+                        if (msgRoot.TryGetProperty("open", out var mo) && mo.ValueKind == JsonValueKind.Object)
+                        {
+                            string lKind = mo.TryGetProperty("kind", out var lk) && lk.ValueKind == JsonValueKind.String ? (lk.GetString() ?? "") : "";
+                            string lTarget = mo.TryGetProperty("target", out var lt) && lt.ValueKind == JsonValueKind.String ? (lt.GetString() ?? "") : "";
+                            bool lReveal = mo.TryGetProperty("reveal", out var lr) && lr.ValueKind == JsonValueKind.True;
+                            mLink = MessageLink.TryCreate(lKind, lTarget, lReveal);
+                        }
                         _onMessage?.Invoke(mText, mKind, mPersistent, mId);
+                        _onMessageDetails?.Invoke(mId, mAgent, mLink);
                         await WriteJsonResponseAsync(stream, 200, "{\"ok\":true}", ct);
                     }
                     catch
@@ -582,7 +692,29 @@ internal static class ApprovalToastManager
         {
             return ScreenshotCardHeight;
         }
-        return ToolCardHeight;
+        return ToolCardHeight + ExtraBodyHeight(req, false);
+    }
+
+    internal static bool ShowsRisk(ApprovalRequestDto req) =>
+        !string.Equals(req.Kind, "oauth_consent", StringComparison.OrdinalIgnoreCase) && req.Assessment != null
+        && req.Assessment.Level is "medium" or "high" or "critical";
+
+    internal static int PreviewLineCount(ApprovalRequestDto req) =>
+        req.Preview == null || string.IsNullOrEmpty(req.Preview.Text) ? 0 : req.Preview.Text.Replace("\r", "").TrimEnd('\n').Split('\n').Length;
+
+    /// <summary>Room for the v0.5 risk block and change preview, so they are visible without scrolling.</summary>
+    internal static int ExtraBodyHeight(ApprovalRequestDto req, bool expanded)
+    {
+        if (string.Equals(req.Kind, "oauth_consent", StringComparison.OrdinalIgnoreCase) || req.Tool == "take_screenshot") return 0;
+        int extra = 0;
+        if (ShowsRisk(req))
+        {
+            var a = req.Assessment!;
+            int reasons = Math.Min(a.Reasons?.Count ?? 0, expanded ? 6 : 3);
+            extra += 56 + reasons * 21 + (string.IsNullOrWhiteSpace(a.Escalated) ? 0 : 24);
+        }
+        if (req.Preview != null) extra += 52 + Math.Max(1, Math.Min(PreviewLineCount(req), expanded ? 18 : 6)) * 17;
+        return Math.Min(extra, expanded ? 440 : 320);
     }
 
     /// <summary>
@@ -809,6 +941,13 @@ internal sealed class ApprovalToastForm : Form
     private Color BoxColor => Light ? Color.FromArgb(238, 241, 247) : Color.FromArgb(11, 14, 18);
     private Color AccentText => Light ? Color.FromArgb(66, 77, 206) : Color.FromArgb(183, 190, 255);
     private bool HasWarning => !string.IsNullOrWhiteSpace(_req.Warning) || (_isOAuthConsent && _req.Risk == "unknown_site");
+    private string RiskLevel => _isOAuthConsent ? "low" : (_req.Assessment?.Level ?? "low");
+    private bool RiskShown => ApprovalToastManager.ShowsRisk(_req);
+    internal bool Grantable => _isOAuthConsent || _req.Assessment?.Grantable != false;
+    private Color RiskColor => RiskLevel == "critical" ? Theme.Danger : RiskLevel == "high" ? Theme.Warning : Theme.Info;
+    private Color RiskInk => RiskLevel == "critical" ? (Light ? Theme.LightDangerText : Theme.DangerText)
+        : RiskLevel == "high" ? (Light ? Color.FromArgb(133, 82, 0) : Theme.WarningText)
+        : (Light ? Theme.LightInfoText : Theme.InfoText);
     private static Font Ui(float px, bool strong = false) => PanelTypography.Get(px, strong);
     private double Remaining => Math.Max(0, _timeoutSec - (DateTime.UtcNow - _startedAt).TotalSeconds);
     internal bool IsExpanded => _expanded;
@@ -858,6 +997,8 @@ internal sealed class ApprovalToastForm : Form
         "read_file" => I18n.T("Confirm file reading", "Подтвердите чтение файла"),
         "write_file" => I18n.T("Confirm file writing", "Подтвердите запись файла"),
         "edit_file" => I18n.T("Confirm file changes", "Подтвердите изменение файла"),
+        "file_ops" => I18n.T("Confirm file operation", "Подтвердите операцию с файлами"),
+        "read_image" => I18n.T("Confirm image viewing", "Подтвердите просмотр изображения"),
         _ => I18n.T("Confirm action", "Подтвердите действие"),
     };
     private string Purpose => !string.IsNullOrWhiteSpace(_req.Note) ? _req.Note.Trim() : I18n.T("An AI agent requests permission to perform this action.", "AI-агент запрашивает разрешение на это действие.");
@@ -883,6 +1024,7 @@ internal sealed class ApprovalToastForm : Form
     {
         int width = _isOAuthConsent ? 904 : _expanded ? 736 : 576;
         int height = _isOAuthConsent ? (HasWarning ? 556 : 484) : _expanded ? (_isScreenshot ? 604 : 566) : _isScreenshot ? 468 : 382;
+        height += ApprovalToastManager.ExtraBodyHeight(_req, _expanded);
         width = Math.Min((int)(width * ScaleFactor), _widthLimit);
         if (_isOAuthConsent && width / ScaleFactor < 740) height += 248;
         else if (!_isOAuthConsent && width / ScaleFactor < 440) height += 100;
@@ -948,9 +1090,9 @@ internal sealed class ApprovalToastForm : Form
         var st = r.Contains(_mouse) ? ButtonState.Hover : ButtonState.Normal;
         if (!Light) Theme.DrawButton(g, r, label, kind, st, font: Ui(13, true), radius: 11, icon: icon);
         else {
-            Color bg = kind == ButtonKind.Primary ? Theme.Accent : kind == ButtonKind.Outline ? Color.FromArgb(241, 241, 255) : Color.FromArgb(234, 237, 244);
+            Color bg = kind == ButtonKind.Primary ? Theme.Accent : kind == ButtonKind.Danger ? Theme.LightDangerText : kind == ButtonKind.Outline ? Color.FromArgb(241, 241, 255) : Color.FromArgb(234, 237, 244);
             Theme.FillRound(g, r, 11, bg); Theme.StrokeRound(g, r, 11, kind == ButtonKind.Outline ? Theme.Accent : BorderColor);
-            UiText(g, label, Ui(13, true), kind == ButtonKind.Primary ? Color.White : kind == ButtonKind.Outline ? AccentText : Primary, RectangleF.Inflate(r, -4, 0), true);
+            UiText(g, label, Ui(13, true), kind is ButtonKind.Primary or ButtonKind.Danger ? Color.White : kind == ButtonKind.Outline ? AccentText : Primary, RectangleF.Inflate(r, -4, 0), true);
         }
         AddHit(r, action, label);
     }
@@ -1000,6 +1142,86 @@ internal sealed class ApprovalToastForm : Form
         Paragraph(g, message, x + 40, y + 8, width - 48, Ui(12.5f), ink, 19);
         return y + height + 14;
     }
+    // v0.5: the server's risk reading in plain words: headline, up to six reasons and why the card appeared.
+    private float RiskBlock(Graphics g, float x, float y, float width)
+    {
+        var a = _req.Assessment!; Color c = RiskColor, ink = RiskInk;
+        string head = !string.IsNullOrWhiteSpace(a.Headline) ? a.Headline.Trim() : RiskLevel switch
+        {
+            "critical" => I18n.T("Critical risk: check every word", "Критический риск: проверьте каждое слово"),
+            "high" => I18n.T("High risk: read before allowing", "Высокий риск: прочитайте перед разрешением"),
+            _ => I18n.T("Worth a look", "Стоит проверить"),
+        };
+        var font = Ui(12.5f);
+        var rows = new List<(string Text, bool Bullet)>();
+        foreach (string reason in (a.Reasons ?? new()).Where(s => !string.IsNullOrWhiteSpace(s)).Take(_expanded ? 6 : 3))
+        {
+            var wrapped = Wrap(g, reason.Trim(), font, width - 66);
+            for (int i = 0; i < wrapped.Count; i++) rows.Add((wrapped[i], i == 0));
+        }
+        string why = a.Escalated switch
+        {
+            "rule" => I18n.T("This tool normally runs without asking; the card appeared because of the risk.", "Обычно этот инструмент работает без вопроса; карточка появилась из-за риска."),
+            "grant" => I18n.T("Your temporary grant does not cover critical actions.", "Временный доступ не распространяется на критичные действия."),
+            "redflag" => I18n.T("Matches a dangerous-command rule from your settings.", "Совпадает с правилом опасных команд из ваших настроек."),
+            _ => "",
+        };
+        var whyLines = why.Length > 0 ? Wrap(g, why, Ui(11.5f), width - 52) : new List<string>();
+        float height = 40 + rows.Count * 19 + whyLines.Count * 18 + (rows.Count > 0 || whyLines.Count > 0 ? 8 : -6);
+        var box = new RectangleF(x, y, width, height);
+        Theme.FillRound(g, box, 11, Theme.WithAlpha(c, Light ? 26 : RiskLevel == "critical" ? 30 : 22));
+        Theme.StrokeRound(g, box, 11, Theme.WithAlpha(c, RiskLevel == "critical" ? 160 : 110), RiskLevel == "critical" ? 1.4f : 1f);
+        Theme.DrawIcon(g, RiskLevel == "medium" ? IconKind.Info : IconKind.Warning, new(x + 12, y + 11, 18, 18), ink, 1.6f);
+        UiText(g, head, Ui(13, true), ink, new(x + 40, y + 8, width - 52, 22));
+        float ly = y + 34;
+        foreach (var (text, bullet) in rows)
+        {
+            if (bullet) Theme.FillRound(g, new(x + 44, ly + 8, 4, 4), 2, ink);
+            UiText(g, text, font, Primary, new(x + 56, ly, width - 64, 19)); ly += 19;
+        }
+        if (whyLines.Count > 0) { ly += 2; foreach (string line in whyLines) { UiText(g, line, Ui(11.5f), Secondary, new(x + 40, ly, width - 52, 18)); ly += 18; } }
+        return y + height + 12;
+    }
+    // v0.5: what the write/edit changes, with +/- counts and coloured lines of the compact diff.
+    private float DiffBlock(Graphics g, float x, float y, float width)
+    {
+        var p = _req.Preview!;
+        var all = (p.Text ?? "").Replace("\r", "").TrimEnd('\n').Split('\n').Where(l => l.Length > 0).ToList();
+        int limit = _expanded ? 18 : 6;
+        var shown = all.Take(limit).ToList();
+        float lineH = 17, height = 38 + Math.Max(1, shown.Count) * lineH + (all.Count > limit ? 22 : 0) + 8;
+        var box = new RectangleF(x, y, width, height);
+        Theme.FillRound(g, box, 10, BoxColor); Theme.StrokeRound(g, box, 10, BorderColor);
+        string title = p.Exists ? I18n.T("Changes", "Изменения") : I18n.T("New file", "Новый файл");
+        UiText(g, title, Ui(12.5f, true), Primary, new(x + 12, y + 7, width * .5f, 22));
+        Color addInk = Light ? Theme.LightSuccessText : Theme.SuccessText, delInk = Light ? Theme.LightDangerText : Theme.DangerText;
+        string plus = "+" + p.Added, minus = "−" + p.Removed;
+        float pw = Theme.MeasureText(g, plus, Ui(12, true)).Width + 16, mw = Theme.MeasureText(g, minus, Ui(12, true)).Width + 16;
+        var mr = new RectangleF(x + width - 12 - mw, y + 8, mw, 20); var pr = new RectangleF(mr.X - 6 - pw, y + 8, pw, 20);
+        Theme.FillRound(g, pr, 10, Theme.WithAlpha(Theme.Success, 34)); UiText(g, plus, Ui(12, true), addInk, pr, true);
+        if (p.Exists) { Theme.FillRound(g, mr, 10, Theme.WithAlpha(Theme.Danger, 34)); UiText(g, minus, Ui(12, true), delInk, mr, true); }
+        var mono = Theme.FontMono(9.5f);
+        float ly = y + 34;
+        if (shown.Count == 0) UiText(g, I18n.T("No visible text changes", "Видимых изменений текста нет"), Ui(12), Secondary, new(x + 12, ly, width - 24, lineH));
+        foreach (string raw in shown)
+        {
+            char k = raw[0];
+            Color ink = k == '+' ? addInk : k == '-' ? delInk : Secondary;
+            if (k == '+' || k == '-') Theme.FillRound(g, new(x + 6, ly, width - 12, lineH), 3, Theme.WithAlpha(k == '+' ? Theme.Success : Theme.Danger, Light ? 22 : 18));
+            string text = raw.Replace("\t", "    ");
+            float max = width - 28;
+            if (Theme.MeasureText(g, text, mono).Width > max) { while (text.Length > 1 && Theme.MeasureText(g, text + "…", mono).Width > max) text = text[..^1]; text += "…"; }
+            UiText(g, text, mono, ink, new(x + 12, ly, width - 24, lineH)); ly += lineH;
+        }
+        if (all.Count > limit)
+        {
+            var more = new RectangleF(x + 12, ly + 2, width - 24, 20);
+            string label = _expanded ? I18n.Format("…and {0} more lines in the full diff", "…и ещё строк: {0}", all.Count - limit) : I18n.Format("Show {0} more lines", "Показать ещё строк: {0}", all.Count - limit);
+            UiText(g, label, Ui(12, true), AccentText, more);
+            if (!_expanded) AddHit(more, () => SetExpanded(true), label, body: true);
+        }
+        return y + height + 12;
+    }
     private float Code(Graphics g, float x, float y, float width)
     {
         string payload = CopyPayload; if (payload.Length == 0) payload = I18n.T("Target not provided", "Цель не указана");
@@ -1035,7 +1257,7 @@ internal sealed class ApprovalToastForm : Form
         Theme.DrawShadow(g, r, 16, 6, 80, 2);
         if (Neon) Theme.DrawGlow(g, r, 16, Theme.WithAlpha(Theme.Accent, 110), 5, 1);
         Theme.FillRoundGradient(g, r, 16, Light ? Color.White : Theme.BgGradTop, Light ? Color.FromArgb(246, 248, 252) : Theme.BgGradBottom);
-        Theme.StrokeRound(g, r, 16, HasWarning ? Theme.WithAlpha(Theme.Warning, 130) : Neon ? Theme.Accent : BorderColor);
+        Theme.StrokeRound(g, r, 16, HasWarning ? Theme.WithAlpha(Theme.Warning, 130) : RiskLevel == "critical" ? Theme.WithAlpha(Theme.Danger, 180) : RiskLevel == "high" ? Theme.WithAlpha(Theme.Warning, 140) : Neon ? Theme.Accent : BorderColor, RiskLevel == "critical" ? 1.6f : 1f);
         var clipState = g.Save(); using (var path = Theme.RoundRect(r, 16)) g.SetClip(path, CombineMode.Intersect);
         float headerBottom = DrawHeader(g, r);
         float footerHeight = W < 440 ? (_isOAuthConsent ? 130 : 114) : 74;
@@ -1066,9 +1288,7 @@ internal sealed class ApprovalToastForm : Form
         bool brand = _expanded && !_isOAuthConsent;
         float top = r.Y;
         if (brand) {
-            PointF[] Hex(float cx, float cy, float rad) => Enumerable.Range(0, 6).Select(i => { double a = (i * 60 - 90) * Math.PI / 180; return new PointF(cx + rad * (float)Math.Cos(a), cy + rad * (float)Math.Sin(a)); }).ToArray();
-            using(var brush = new LinearGradientBrush(new RectangleF(r.X + 21, r.Y + 16, 22, 24), Theme.AccentHover, Theme.Accent, 90f)) g.FillPolygon(brush, Hex(r.X + 32, r.Y + 28, 11));
-            using(var pen = new Pen(Color.White, 2)) { pen.LineJoin = LineJoin.Round; g.DrawPolygon(pen, Hex(r.X + 32, r.Y + 28, 5.2f)); }
+            Theme.DrawLogo(g, new RectangleF(r.X + 18, r.Y + 14, 28, 28));
             UiText(g, Theme.ProductName, Ui(15, true), Primary, new(r.X + 54, r.Y + 10, 230, 36));
             top += 54; Line(g, r.X, top, r.Right);
         }
@@ -1082,8 +1302,8 @@ internal sealed class ApprovalToastForm : Form
             UiText(g, ((int)Math.Ceiling(Remaining)) + I18n.T(" s", " с"), Ui(12, true), Light ? Color.FromArgb(133, 82, 0) : Theme.Warning, new(timer.X + 24, timer.Y, timerW - 26, 28), true);
         }
         float hx = r.X + 24, hy = top + (W < 440 ? 54 : 20), tile = _isOAuthConsent ? 34 : 46;
-        IconKind ik = _isOAuthConsent ? IconKind.Link : _isScreenshot ? IconKind.Eye : _req.Tool == "run_command" ? IconKind.Terminal : IconKind.File;
-        Color tint = _isOAuthConsent || _isScreenshot ? Theme.Teal : Theme.Violet;
+        IconKind ik = _isOAuthConsent ? IconKind.Link : _isScreenshot ? IconKind.Eye : _req.Tool == "run_command" ? IconKind.Terminal : _req.Tool == "file_ops" ? IconKind.Folder : _req.Tool == "read_image" ? IconKind.Image : IconKind.File;
+        Color tint = _isOAuthConsent || _isScreenshot ? Theme.Teal : RiskLevel == "critical" ? Theme.Danger : RiskLevel == "high" ? Theme.Warning : Theme.Violet;
         Theme.DrawIconTile(g, new(hx, hy, tile, tile), ik, tint);
         float tx = hx + tile + 16, tw = r.Right - tx - (W < 440 ? 24 : brand ? 48 : 158);
         string title = _isOAuthConsent ? I18n.T("OAuth 2.1 connection", "Подключение OAuth 2.1") : Heading;
@@ -1135,7 +1355,8 @@ internal sealed class ApprovalToastForm : Form
             if (_previewImage == null) y = Warning(g, I18n.T("The screenshot preview could not be loaded. Verify the source before allowing.", "Не удалось загрузить предпросмотр скриншота. Проверьте источник перед разрешением."), x, y, width);
             if (_expanded) y = LabelValue(g, I18n.T("Description", "Описание"), !string.IsNullOrWhiteSpace(_req.Description) ? _req.Description! : Purpose, x, y, width);
         } else {
-            string client = string.IsNullOrWhiteSpace(_req.ClientName) ? I18n.T("AI agent · source not specified", "AI-агент · источник не указан") : _req.ClientName;
+            if (RiskShown) y = RiskBlock(g, x, y, width);
+            string client = !string.IsNullOrWhiteSpace(_req.Agent) ? _req.Agent!.Trim() : string.IsNullOrWhiteSpace(_req.ClientName) ? I18n.T("AI agent · source not specified", "AI-агент · источник не указан") : _req.ClientName;
             y = LabelValue(g, I18n.T("Requested by", "Запрашивает"), client, x, y, width);
             string targetLabel = _req.Tool == "run_command" ? I18n.T("Command", "Команда") : I18n.T("Target", "Цель");
             if (width >= 410) {
@@ -1146,11 +1367,15 @@ internal sealed class ApprovalToastForm : Form
                 UiText(g, targetLabel, Ui(12), Secondary, new(x, y, width, 20));
                 y = Code(g, x, y + 25, width);
             }
+            if (_req.Preview != null) y = DiffBlock(g, x, y, width);
             if (_expanded || Purpose.Length > 120) y = LabelValue(g, I18n.T("Purpose", "Цель запроса"), Purpose, x, y, width);
             if (!string.IsNullOrWhiteSpace(_req.Summary?.Detail)) y = LabelValue(g, I18n.T("Details", "Подробности"), _req.Summary.Detail, x, y, width);
         }
         if (_expanded || !_isScreenshot) {
-            y = LabelValue(g, I18n.T("Temporary grant", "Временный доступ"), _grantScope == "exact" ? I18n.T("Only this command or file", "Только эта команда или файл") : I18n.Format("For this tool: {0}", "Для инструмента: {0}", _req.Tool), x, y, width);
+            string grantText = !Grantable
+                ? I18n.T("Not offered: critical actions are approved one at a time", "Не предлагается: критичные действия подтверждаются по одному")
+                : _grantScope == "exact" ? I18n.T("Only this command or file", "Только эта команда или файл") : I18n.Format("For this tool: {0}", "Для инструмента: {0}", _req.Tool);
+            y = LabelValue(g, I18n.T("Temporary grant", "Временный доступ"), grantText, x, y, width);
             y = LabelValue(g, I18n.T("Time remaining", "Осталось времени"), TimeSpan.FromSeconds(Math.Ceiling(Remaining)).ToString(@"m\:ss"), x, y, width);
         }
         if (!string.IsNullOrWhiteSpace(_req.Warning)) y = Warning(g, _req.Warning!, x, y, width);
@@ -1225,6 +1450,17 @@ internal sealed class ApprovalToastForm : Form
             Button(g, _btnAllowRect, I18n.T("Allow connection", "Разрешить подключение"), ButtonKind.Primary, () => ForceResolve("allow", null, null, "user"), IconKind.Link);
         } else {
             float detailsW = 30; width -= detailsW + 10;
+            if (!Grantable) {
+                // Critical: no temporary grant on offer, only a decision about this exact call.
+                float dW = W < 440 ? width * .42f : Math.Min(150, width * .32f);
+                _btnDismissRect = new(x, y, dW, 38);
+                _btnGrantMainRect = RectangleF.Empty; _btnGrantArrowRect = RectangleF.Empty;
+                _btnAllowRect = new(x + dW + 10, y, width - dW - 10, 38);
+                Button(g, _btnDismissRect, I18n.T("Deny", "Отклонить"), ButtonKind.Secondary, () => ForceResolve("deny", null, null, "user"));
+                Button(g, _btnAllowRect, I18n.T("Allow this once", "Разрешить только этот раз"), ButtonKind.Danger, () => ForceResolve("allow_once", null, null, "user"), IconKind.Warning);
+                IconButton(g, new(r.Right - 48, y, 32, 38), _expanded ? IconKind.ChevronUp : IconKind.ChevronDown, _expanded ? I18n.T("Collapse", "Свернуть") : I18n.T("More details", "Подробнее"), () => SetExpanded(!_expanded));
+                return;
+            }
             float denyW = Math.Min(116, width * .24f), grantW = (width - denyW - 20) * .51f, allowW = width - denyW - grantW - 20;
             if (W < 440) { denyW = width * .42f; grantW = width - denyW - 10; allowW = width; }
             _btnDismissRect = new(x, y, denyW, 38);
@@ -1337,6 +1573,11 @@ internal sealed class ApprovalToastForm : Form
         if (_isOAuthConsent && (decision == "allow_once" || decision == "allow_grant"))
         {
             normalizedDecision = "allow";
+        }
+        if (!Grantable && decision == "allow_grant")
+        {
+            // Critical calls are approved one at a time; never answer them with a grant.
+            normalizedDecision = "allow_once"; grantMinutes = null; grantScope = null;
         }
 
         string? chosenOAuthScope = _isOAuthConsent ? GetSelectedOAuthScope() : null;
@@ -1569,6 +1810,7 @@ internal sealed class ScreenshotViewerForm : Form
     {
         _image = image;
         Text = I18n.T("Screenshot", "Скриншот");
+        Theme.ApplyLogo(this);
         FormBorderStyle = FormBorderStyle.Sizable;
         StartPosition = FormStartPosition.CenterScreen;
         ShowInTaskbar = true;
@@ -1685,13 +1927,8 @@ internal sealed class ScreenshotViewerForm : Form
             _folderBtn.FlatAppearance.BorderSize = 0;
             _folderBtn.Click += (_, _) =>
             {
-                try
-                {
-                    string dir = ScreenshotArchiveConfig.Dir;
-                    Directory.CreateDirectory(dir);
-                    System.Diagnostics.Process.Start("explorer.exe", dir);
-                }
-                catch { }
+                string dir = ScreenshotArchiveConfig.Dir;
+                DesktopLauncher.OpenFolder(dir);
             };
             _infoBar.Controls.Add(_folderBtn);
         }

@@ -277,7 +277,7 @@ internal sealed class ConnectionSetupForm : Form
     {
         Text = I18n.T("Connection settings", "Настройки подключения");
         BackColor = Theme.Bg1; ForeColor = Theme.TextPrimary;
-        Font = new Font("Segoe UI", 10f); StartPosition = FormStartPosition.CenterParent;
+        Font = new Font("Segoe UI", 10f); StartPosition = FormStartPosition.CenterParent; Theme.ApplyLogo(this);
         FormBorderStyle = FormBorderStyle.FixedDialog; MaximizeBox = false; MinimizeBox = false;
         ClientSize = new Size(700, 650); AutoScaleMode = AutoScaleMode.Dpi;
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, Padding = new Padding(24), ColumnCount = 1, RowCount = 1, AutoScroll = true };
@@ -289,7 +289,7 @@ internal sealed class ConnectionSetupForm : Form
             var b = new TextBox { Text = value, UseSystemPasswordChar = secret, Dock = DockStyle.Top, BackColor = Theme.SurfaceRaised, ForeColor = Theme.TextPrimary, BorderStyle = BorderStyle.FixedSingle, Margin = new Padding(0, 0, 0, 16) };
             layout.Controls.Add(b); return b;
         }
-        void Open(string url) { try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); } catch { } }
+        void Open(string url) => DesktopLauncher.OpenUrl(url);
         var link = new LinkLabel { Text = mode == "ngrok" ? I18n.T("Open ngrok account / domains", "Открыть аккаунт ngrok / домены") : I18n.T("Open Cloudflare dashboard", "Открыть панель Cloudflare"), AutoSize = true, LinkColor = Theme.Info, Margin = new Padding(0, 0, 0, 16) };
         link.LinkClicked += (_, _) => Open(mode == "ngrok" ? "https://dashboard.ngrok.com/" : "https://dash.cloudflare.com/");
         if (mode is "ngrok" or "cloudflare") layout.Controls.Add(link);

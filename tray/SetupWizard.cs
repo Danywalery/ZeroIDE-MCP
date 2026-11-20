@@ -76,6 +76,19 @@ internal static class SetupLaunch
         catch { return false; }
     }
     public static string LegacyInstallDir => Path.Combine(LocalRoot, "AgentPower");
+    /// <summary>The pre-rename build (AgentPowerTray.exe, or ZeroIDE-MCP.exe started from the old folder) still runs: its files cannot be moved.</summary>
+    public static bool LegacyAppRunning()
+    {
+        try
+        {
+            return Process.GetProcessesByName("AgentPowerTray").Concat(Process.GetProcessesByName("ZeroIDE-MCP")).Any(p =>
+            {
+                if (p.Id == Environment.ProcessId) return false;
+                try { return p.MainModule?.FileName?.StartsWith(LegacyInstallDir, StringComparison.OrdinalIgnoreCase) ?? false; } catch { return false; }
+            });
+        }
+        catch { return false; }
+    }
 
     /// <summary>Runs a shipped PowerShell script hidden, streaming its output lines; UTF-8 so localized JSON survives.</summary>
     public static Process StartScript(string script, string arguments, string workingDirectory)
@@ -111,7 +124,7 @@ internal static class WizardText
 internal sealed class WizardButton : Button
 {
     private readonly ButtonKind _kind;
-    private bool _hover;
+    private bool _hover, _pressed;
     public WizardButton(string text, Action action, ButtonKind kind = ButtonKind.Secondary, int minWidth = 110)
     {
         Text = text; _kind = kind; FlatStyle = FlatStyle.Flat; FlatAppearance.BorderSize = 0; Cursor = Cursors.Hand;
@@ -119,12 +132,15 @@ internal sealed class WizardButton : Button
         Width = Math.Max(minWidth, TextRenderer.MeasureText(text, Font).Width + 44);
         SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer, true);
         AccessibleName = text; Click += (_, _) => action();
-        MouseEnter += (_, _) => { _hover = true; Invalidate(); }; MouseLeave += (_, _) => { _hover = false; Invalidate(); };
+        MouseEnter += (_, _) => { _hover = true; Invalidate(); };
+        MouseLeave += (_, _) => { _hover = false; _pressed = false; Invalidate(); };
+        MouseDown += (_, _) => { _pressed = true; Invalidate(); };
+        MouseUp += (_, _) => { _pressed = false; Invalidate(); };
     }
     protected override void OnPaint(PaintEventArgs e)
     {
         e.Graphics.Clear(Parent?.BackColor ?? Theme.Bg1); Theme.PrepareGraphics(e.Graphics);
-        var state = !Enabled ? ButtonState.Disabled : _hover || Focused ? ButtonState.Hover : ButtonState.Normal;
+        var state = !Enabled ? ButtonState.Disabled : _pressed ? ButtonState.Pressed : (_hover || Focused ? ButtonState.Hover : ButtonState.Normal);
         Theme.DrawButton(e.Graphics, new RectangleF(5, 5, Width - 10, Height - 10), Text, _kind, state, Font);
     }
 }
@@ -251,7 +267,7 @@ internal sealed class WizardRail : Control
         var g = e.Graphics; Theme.PrepareGraphics(g);
         using (var brush = new System.Drawing.Drawing2D.LinearGradientBrush(ClientRectangle, Theme.Bg0, Theme.Bg1, 90f)) g.FillRectangle(brush, ClientRectangle);
         using (var pen = new Pen(Theme.Divider)) g.DrawLine(pen, Width - 1, 0, Width - 1, Height);
-        Theme.DrawStatusDot(g, new PointF(40, 44), 7, Theme.Accent, true);
+        Theme.DrawLogo(g, new RectangleF(27, 31, 26, 26));
         Theme.DrawText(g, Theme.ProductName, Theme.Title, Theme.TextPrimary, new RectangleF(58, 28, 170, 32));
         Theme.DrawText(g, I18n.T("Setup", "Настройка"), Theme.Caption, Theme.TextTertiary, new RectangleF(58, 56, 170, 18));
         float y = 112;
@@ -299,6 +315,7 @@ internal sealed partial class SetupWizardForm : Form
     private SetupWizardForm(string packageRoot, TrayContext? ctx)
     {
         _packageRoot = packageRoot; _ctx = ctx;
+        Theme.ApplyLogo(this);
         if (Package)
         {
             string[] args = Environment.GetCommandLineArgs(); int langArg = Array.IndexOf(args, "--lang");
@@ -307,7 +324,6 @@ internal sealed partial class SetupWizardForm : Form
         Text = Theme.ProductName + I18n.T(" — Setup", " — Настройка");
         FormBorderStyle = FormBorderStyle.FixedSingle; MaximizeBox = false; ClientSize = new Size(960, 680);
         StartPosition = FormStartPosition.CenterScreen; BackColor = Theme.Bg1; ForeColor = Theme.TextPrimary; Font = Theme.Body;
-        try { Icon = Theme.MakeTrayIcon(Theme.Accent); } catch { }
         DoubleBuffered = true;
 
         _rail = new WizardRail(Package
@@ -389,7 +405,7 @@ internal sealed partial class SetupWizardForm : Form
         if (left != null) _footerLeft.Controls.Add(left);
         foreach (var b in right.Reverse()) _footerRight.Controls.Add(b);
     }
-    private static void OpenUrl(string url) { try { Process.Start(new ProcessStartInfo(url) { UseShellExecute = true }); } catch { } }
+    private static bool OpenUrl(string url) => DesktopLauncher.OpenUrl(url);
     private static string Dir(string path) => path.Replace(SetupLaunch.LocalRoot, "%LOCALAPPDATA%", StringComparison.OrdinalIgnoreCase).Replace(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "%LOCALAPPDATA%", StringComparison.OrdinalIgnoreCase);
 
     // ---------------------------------------------------------------- steps
@@ -485,26 +501,32 @@ internal sealed partial class SetupWizardForm : Form
 
     private void StepInstall(bool update = false)
     {
-        Head(update ? "Update" : "Install", update ? "Обновление" : "Установка",
+        // An installation under the old name (AgentPower) is updated in place: the installer moves its state over.
+        bool legacy = !update && Directory.Exists(SetupLaunch.LegacyInstallDir);
+        bool legacyRunning = legacy && SetupLaunch.LegacyAppRunning();
+        bool asUpdate = update || legacy;
+        Head(asUpdate ? "Update" : "Install", asUpdate ? "Обновление" : "Установка",
             "Installs into your user folder. No administrator rights needed.", "Ставится в папку пользователя. Права администратора не нужны.");
         var missing = SetupLaunch.MissingPackageFiles(_packageRoot);
         bool ports = update || (SetupLaunch.PortFree(39011) && SetupLaunch.PortFree(39012));
         bool running = update && SetupLaunch.InstalledAppRunning();
-        bool legacy = !update && Directory.Exists(SetupLaunch.LegacyInstallDir);
-        bool ok = missing.Length == 0 && ports && !running && !legacy;
+        bool ok = missing.Length == 0 && ports && !running && !legacyRunning;
         Space(6);
         var items = new List<WizardStep>();
-        if (legacy) items.Add(new(I18n.T("An earlier build is installed in ", "Найдена более ранняя сборка в ") + Dir(SetupLaunch.LegacyInstallDir) + I18n.T(". Exit it (tray icon → Exit), then delete or rename that folder and check again.", ". Закрой её (иконка в трее → Выход), потом удали или переименуй эту папку и проверь снова."), "current"));
+        if (legacy) items.Add(new(legacyRunning
+            ? I18n.T("Close the earlier build first: its tray icon → Exit. Then check again.", "Сначала закрой прежнюю сборку: её иконка в трее → Выход. Потом проверь снова.")
+            : I18n.T("An earlier build was found in ", "Найдена прежняя сборка в ") + Dir(SetupLaunch.LegacyInstallDir) + I18n.T(": its settings, access tokens, connection address and logs move into this installation; the old folder is then removed.", ": её настройки, токены доступа, адрес подключения и журнал переедут в эту установку; старая папка затем будет удалена."),
+            legacyRunning ? "current" : "done"));
         items.AddRange([
             new(missing.Length == 0 ? I18n.T("Package files are complete", "Файлы пакета на месте") : I18n.T("Package is incomplete: ", "В пакете не хватает: ") + string.Join(", ", missing) + I18n.T(". Download zeroide-mcp.zip from Releases (not “Source code”).", ". Скачай zeroide-mcp.zip со страницы Releases (не «Source code»)."), missing.Length == 0 ? "done" : "current"),
             new(ports ? I18n.T("Ports 39011 and 39012 are free", "Порты 39011 и 39012 свободны") : I18n.T("Port 39011 or 39012 is busy. Close the program that uses it (or an older ZeroIDE MCP) and come back.", "Порт 39011 или 39012 занят. Закрой программу, которая его использует (или старый ZeroIDE MCP), и вернись сюда."), ports ? "done" : "current"),
             new(running ? I18n.T("Close ZeroIDE MCP first: tray icon → Exit.", "Сначала закрой ZeroIDE MCP: иконка в трее → Выход.") : !update && SetupLaunch.HasUnfinishedInstall ? I18n.T("An unfinished installation was found in ", "Найдена незавершённая установка в ") + Dir(SetupLaunch.InstallDir) + I18n.T("; it will be completed.", "; она будет завершена.") : I18n.T("Folder: ", "Папка: ") + Dir(SetupLaunch.InstallDir), running ? "current" : "done"),
             new(I18n.T("Internet is needed once, to download Node.js (about 30 MB) from nodejs.org", "Интернет нужен один раз: скачать Node.js (около 30 МБ) с nodejs.org"), "todo")]);
         Checklist(items.ToArray());
-        Para(update
+        Para(asUpdate
             ? "What happens: the app, server and helper scripts are replaced with this version. Your settings, access tokens, connections and logs stay."
             : "What happens: the app and server are copied, Node.js is downloaded and its checksum verified, a local key is created (it is never shown), and a Start Menu shortcut is added. Nothing starts and nothing is added to autostart.",
-            update
+            asUpdate
             ? "Что произойдёт: приложение, сервер и вспомогательные скрипты заменятся на эту версию. Настройки, токены доступа, подключения и журналы сохранятся."
             : "Что произойдёт: скопируем приложение и сервер, скачаем Node.js и проверим его контрольную сумму, создадим локальный ключ (он никогда не показывается), добавим ярлык в меню «Пуск». Ничего не запускается и не попадает в автозагрузку.");
         var status = Small("", "", Theme.TextPrimary, 6);
@@ -515,23 +537,24 @@ internal sealed partial class SetupWizardForm : Form
         if (ok)
         {
             WizardButton? start = null;
-            start = Btn(update ? "Update" : "Install", update ? "Обновить" : "Установить", () => _ = RunInstallAsync(update, status, progress, log, start!, back), ButtonKind.Primary);
+            string args = update ? "-Update" : legacy ? "-MigrateFrom \"" + SetupLaunch.LegacyInstallDir + "\"" : "";
+            start = Btn(asUpdate ? "Update" : "Install", asUpdate ? "Обновить" : "Установить", () => _ = RunInstallAsync(asUpdate, args, status, progress, log, start!, back), ButtonKind.Primary);
             Footer(back, start, Btn("Cancel", "Отмена", Close));
         }
         else Footer(back, Btn("Check again", "Проверить снова", () => { Clear(); StepInstall(update); }, ButtonKind.Primary));
     }
 
-    private async Task RunInstallAsync(bool update, Label status, WizardProgress progress, TextBox log, WizardButton start, WizardButton back)
+    private async Task RunInstallAsync(bool update, string args, Label status, WizardProgress progress, TextBox log, WizardButton start, WizardButton back)
     {
         _busy = true; start.Enabled = false; back.Enabled = false; progress.Visible = true; log.Visible = true; log.Clear();
         _tick = progress.Tick;
-        string[] phases = ["Installing into", "Updating", "Copying server", "Copying tray", "Copying agent", "Portable Node.js", "Server dependencies", "Generating config.env", "tray-config.json", "Start Menu shortcut", "Done"];
-        (string En, string Ru)[] labels = [("Preparing the folder…", "Готовим папку…"), ("Preparing the update…", "Готовим обновление…"), ("Copying the server…", "Копируем сервер…"), ("Copying the app…", "Копируем приложение…"), ("Copying helper scripts…", "Копируем вспомогательные скрипты…"), ("Downloading Node.js — the longest step…", "Скачиваем Node.js — это самый долгий шаг…"), ("Checking server dependencies…", "Проверяем зависимости сервера…"), ("Creating the local key…", "Создаём локальный ключ…"), ("Writing settings…", "Записываем настройки…"), ("Adding the Start Menu shortcut…", "Добавляем ярлык в меню «Пуск»…"), ("Done", "Готово")];
+        string[] phases = ["Moving settings", "Installing into", "Updating", "Copying server", "Copying tray", "Copying agent", "Portable Node.js", "Server dependencies", "Generating config.env", "tray-config.json", "Start Menu shortcut", "Removing the earlier", "Done"];
+        (string En, string Ru)[] labels = [("Moving settings, tokens and connections…", "Переносим настройки, токены и подключения…"), ("Preparing the folder…", "Готовим папку…"), ("Preparing the update…", "Готовим обновление…"), ("Copying the server…", "Копируем сервер…"), ("Copying the app…", "Копируем приложение…"), ("Copying helper scripts…", "Копируем вспомогательные скрипты…"), ("Downloading Node.js — the longest step…", "Скачиваем Node.js — это самый долгий шаг…"), ("Checking server dependencies…", "Проверяем зависимости сервера…"), ("Creating the local key…", "Создаём локальный ключ…"), ("Writing settings…", "Записываем настройки…"), ("Adding the Start Menu shortcut…", "Добавляем ярлык в меню «Пуск»…"), ("Removing the earlier folder…", "Удаляем старую папку…"), ("Done", "Готово")];
         status.Text = I18n.T("Starting…", "Запускаем…");
         var tail = new StringBuilder(); int exit = -1;
         try
         {
-            var p = SetupLaunch.StartScript(Path.Combine(_packageRoot, "installer", "install.ps1"), update ? "-Update" : "", _packageRoot);
+            var p = SetupLaunch.StartScript(Path.Combine(_packageRoot, "installer", "install.ps1"), args, _packageRoot);
             void OnLine(string? line)
             {
                 if (line == null) return;

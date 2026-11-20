@@ -4,8 +4,15 @@
  * Platform layer: PowerShell runner + process-tree kill + Node search +
  * internal dry-run diff on Windows; original bash/grep/diff path on Linux.
  *
- * Tools: run_command, read_file, list_directory, write_file, edit_file,
- *        search_files, job_status, job_output, audit_log
+ * Tools: run_command, job_status, job_output, read_file, read_image,
+ *        list_directory, search_files, write_file, edit_file, file_ops,
+ *        system_info, audit_log, journal_entry, journal_log, user_message,
+ *        task_status, await_owner, agent_message, take_screenshot
+ *
+ * v0.5 ("guardian"): self-protection of ZeroIDE secrets and state, a risk
+ * engine that escalates dangerous calls to an approval card (critical ones
+ * can never be pre-approved by a grant), diff previews on the card, an undo
+ * history (history/index.jsonl + trash) instead of scattered .bak files.
  *
  * Notes:
  *  - Tool annotations describe the real behaviour (audit 2026-11-10: v1 marked
@@ -25,6 +32,7 @@ import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
 import zlib from "node:zlib";
+import { fileURLToPath } from "node:url";
 let LANG = "en";
 function tr(en, ru) { return LANG === "ru" ? ru : en; }
 
@@ -75,16 +83,18 @@ const TRAY_CONTROL_PORT = parseInt(
   10
 );
 const TRAY_CONTROL_SECRET = process.env.TRAY_CONTROL_SECRET || "";
-const SERVER_VERSION = "0.4.0"; // keep equal to server/package.json and agent-manifest.json
+const SERVER_VERSION = "0.5.0"; // keep equal to server/package.json and agent-manifest.json
 
 const AUDIT_MAX_BYTES = 5 * 1024 * 1024; // lowered from 20 MB on 15.08 — at 20 MB rotation never triggered
 const AUDIT_MAX_GENERATIONS = 5;
 const NUDGE_THRESHOLD = 15; // mutating calls without journal_entry, after which we add a reminder
-const MUTATING_TOOLS = new Set(["run_command", "write_file", "edit_file"]);
-const READ_TOOLS = new Set(["read_file", "list_directory", "search_files", "job_status", "job_output", "audit_log", "journal_log", "user_message", "task_status"]);
-const WRITE_TOOLS = new Set(["write_file", "edit_file", "journal_entry"]);
+const MUTATING_TOOLS = new Set(["run_command", "write_file", "edit_file", "file_ops"]);
+const READ_TOOLS = new Set(["read_file", "read_image", "system_info", "list_directory", "search_files", "job_status", "job_output", "audit_log", "journal_log", "user_message", "task_status", "agent_message", "await_owner"]);
+const WRITE_TOOLS = new Set(["write_file", "edit_file", "file_ops", "journal_entry"]);
 const EXEC_TOOLS = new Set(["run_command"]);
-const FILE_TOOLS = new Set(["read_file", "list_directory", "search_files", "write_file", "edit_file"]);
+const FILE_TOOLS = new Set(["read_file", "read_image", "list_directory", "search_files", "write_file", "edit_file", "file_ops"]);
+// Tools whose target path is written to (self-protection checks them as writes).
+const WRITE_PATH_TOOLS = new Set(["write_file", "edit_file", "file_ops"]);
 const DEFAULT_MAX_OUTPUT = 30 * 1024;
 // Wait ceiling in job_status: Notion drops the connection at 60 s (verified:
 // sleep 50 passes, sleep 61 breaks), keeping headroom for network and response.
@@ -600,6 +610,8 @@ function nodeSearchFiles({ query, root, include, regex, ignoreCase, contextLines
     return s.charCodeAt(0) === 0xfeff ? s.slice(1) : s;
   };
   const searchOne = (abs) => {
+    // Never surface ZeroIDE's own credentials through search results.
+    if (selfProtection(abs, "read") === "secret") return;
     let buf;
     try { buf = fs.readFileSync(abs); } catch { return; }
     const text = decodeText(buf);
@@ -663,6 +675,661 @@ function nodeSearchFiles({ query, root, include, regex, ignoreCase, contextLines
   ].filter(Boolean).join("\n");
 }
 
+/* ========== v0.5 · self-protection, risk assessment, file history, helpers ========== */
+
+const SERVER_DIR = path.dirname(fileURLToPath(import.meta.url));
+// A real installation keeps tray-config.json / ZeroIDE-MCP.exe next to the server folder.
+// Source checkouts and test copies have neither, so they are not treated as one.
+const INSTALL_ROOT = (() => {
+  const parent = path.dirname(SERVER_DIR);
+  try {
+    if (fs.existsSync(path.join(parent, "tray-config.json")) || fs.existsSync(path.join(parent, "ZeroIDE-MCP.exe"))) return parent;
+  } catch {}
+  return null;
+})();
+const ALLOW_SELF_ACCESS = process.env.MCP_ALLOW_SELF_ACCESS === "1";
+const HISTORY_DIR = process.env.MCP_HISTORY_DIR || path.join(path.dirname(LOG_DIR), "history");
+const HISTORY_INDEX = path.join(HISTORY_DIR, "index.jsonl");
+const HISTORY_RETENTION_DAYS = Math.max(1, parseInt(process.env.MCP_HISTORY_DAYS || "30", 10) || 30);
+const HISTORY_MAX_FILE_BYTES = 25 * 1024 * 1024; // bigger files are recorded without a copy
+const BACKUP_MODE = ["history", "sidecar", "both"].includes(process.env.MCP_BACKUP_MODE) ? process.env.MCP_BACKUP_MODE : "history";
+const TRASH_MAX_FILES = 20000;
+const TRASH_MAX_BYTES = 2 * 1024 * 1024 * 1024;
+
+// ---- Self-protection ------------------------------------------------------------
+// ZeroIDE's own credentials (the MCP token, the tray control secret, the token and
+// OAuth stores) are never readable through file tools, and its settings, journals,
+// history and program files are never writable through them. Otherwise any client,
+// even a read-only one, could lift the full token from config.env, approve its own
+// requests through the tray control channel or loosen permissions.json.
+// MCP_ALLOW_SELF_ACCESS=1 in config.env lifts the rule for owners who want that.
+function canonicalLoose(p) {
+  const abs = path.resolve(String(p || ""));
+  try { return foldCase(fs.realpathSync.native(abs)); } catch {}
+  try { return foldCase(path.join(fs.realpathSync.native(path.dirname(abs)), path.basename(abs))); } catch {}
+  return foldCase(abs);
+}
+function insideDir(dirCanon, targetCanon) {
+  if (!dirCanon || !targetCanon) return false;
+  if (targetCanon === dirCanon) return true;
+  return targetCanon.startsWith(dirCanon.endsWith(path.sep) ? dirCanon : dirCanon + path.sep);
+}
+let selfProtectCache = null;
+function selfProtectTables() {
+  if (selfProtectCache) return selfProtectCache;
+  const secrets = new Set(
+    [
+      path.join(SERVER_DIR, "config.env"),
+      process.env.MCP_CONFIG_FILE || "",
+      TOKENS_FILE,
+      OAUTH_FILE,
+      path.join(path.dirname(PERMISSIONS_FILE), "telegram.json"),
+      INSTALL_ROOT ? path.join(INSTALL_ROOT, "tray-config.json") : "",
+      INSTALL_ROOT ? path.join(INSTALL_ROOT, "telegram.json") : "",
+    ]
+      .filter(Boolean)
+      .map(canonicalLoose)
+  );
+  const stateFiles = new Set([PERMISSIONS_FILE].map(canonicalLoose));
+  const stateDirs = [LOG_DIR, HISTORY_DIR].map(canonicalLoose);
+  if (INSTALL_ROOT) stateDirs.push(canonicalLoose(INSTALL_ROOT));
+  selfProtectCache = { secrets, stateFiles, stateDirs, root: INSTALL_ROOT ? canonicalLoose(INSTALL_ROOT) : null };
+  return selfProtectCache;
+}
+// null = fine; "secret" = neither read nor write; "state" = read-only for agents.
+function selfProtection(fullPath, intent) {
+  if (ALLOW_SELF_ACCESS || !fullPath) return null;
+  const t = selfProtectTables();
+  const c = canonicalLoose(fullPath);
+  if (t.secrets.has(c)) return "secret";
+  if (t.root && insideDir(t.root, c) && /^(tunnel_key.*|.*\.(token|key|pem))$/i.test(path.basename(c))) return "secret";
+  if (intent === "write" && (t.stateFiles.has(c) || t.stateDirs.some((d) => insideDir(d, c)))) return "state";
+  return null;
+}
+function protectedPathResult(tool, fullPath, kind) {
+  return textResult(
+    [
+      kind === "secret"
+        ? tr("DENIED [PROTECTED_PATH]: this file holds ZeroIDE MCP credentials (tokens, control secret). Agents never get them through MCP tools.", "ОТКАЗ [PROTECTED_PATH]: в этом файле лежат учётные данные ZeroIDE MCP (токены, секрет управления). Агенты не получают их через инструменты MCP.")
+        : tr("DENIED [PROTECTED_PATH]: this is ZeroIDE MCP's own configuration, journal, history or program folder. Agents cannot change it through MCP tools; the owner changes settings in the tray.", "ОТКАЗ [PROTECTED_PATH]: это собственная конфигурация, журнал, история или папка программы ZeroIDE MCP. Агент не может менять её через инструменты MCP; настройки меняет владелец в трее."),
+      "tool: " + tool,
+      "path: " + fullPath,
+      tr("action: Do NOT try other tools or commands to reach this file. If the task really needs it, tell the owner what and why.", "action: НЕ пытайся добраться до файла другими инструментами или командами. Если задаче это действительно нужно, объясни владельцу, что и зачем."),
+    ].join("\n"),
+    true
+  );
+}
+
+// ---- Risk assessment -------------------------------------------------------------
+// A transparent, rule-based reading of what a call can do. It explains the approval
+// card in plain words and powers two safety nets (permissions.json -> riskGate):
+// an "allow" rule no longer passes a high-risk call silently, and a tool-wide
+// temporary grant never covers a critical one: the owner sees that exact call first.
+const RISK_ORDER = { low: 0, medium: 1, high: 2, critical: 3 };
+const riskAtLeast = (level, min) => (RISK_ORDER[level] ?? 0) >= (RISK_ORDER[min] ?? 99);
+const riskRule = (level, group, code, en, ru) => ({ level, group, code, en, ru });
+const TRAY_CONTROL_RE = new RegExp("(127[.]0[.]0[.]1|localhost)[ ]*:[ ]*" + TRAY_CONTROL_PORT + "(?![0-9])", "i");
+const COMMAND_RISK_RULES = [
+  [/simulate-click|X-ZeroIDE-Control|tray-config\.json|\btokens\.json\b|\boauth\.json\b|ZeroIDE-MCP[\\/]+server[\\/]+config\.env/i,
+    riskRule("critical", "self", "zeroide_self", "Touches ZeroIDE MCP's own secrets or approval channel.", "Затрагивает секреты или канал подтверждений самого ZeroIDE MCP.")],
+  [/\b(Remove-Item|Clear-Content|Set-Content|Out-File|Move-Item|Rename-Item|del|erase)\b[^\n]*?(audit\.jsonl|journal\.jsonl|permissions\.json|ZeroIDE-MCP[\\/]+(logs|history|server)\b)/i,
+    riskRule("high", "self", "zeroide_tamper", "Changes ZeroIDE MCP's own journals, history or permissions.", "Меняет журналы, историю или права самого ZeroIDE MCP.")],
+  [/\b(Format-Volume|Clear-Disk|Initialize-Disk|diskpart|cipher(\.exe)?\s+\/w|format(\.com)?\s+[a-z]:)/i,
+    riskRule("critical", "disk", "disk_wipe", "Can erase a whole disk or partition.", "Может стереть целый диск или раздел.")],
+  [/\b(vssadmin(\.exe)?\s+delete|wbadmin(\.exe)?\s+delete|shadowcopy\s+delete|bcdedit)/i,
+    riskRule("critical", "backup", "backup_wipe", "Deletes restore points or changes how Windows boots.", "Удаляет точки восстановления или меняет загрузку Windows.")],
+  [/(Set-MpPreference\b[^\n]*-Disable|Add-MpPreference\b[^\n]*-Exclusion|advfirewall\s+set\s+[^\n]*state\s+off|Set-NetFirewallProfile\b[^\n]*-Enabled\s+(\$?false|0)|\bsc(\.exe)?\s+(stop|config|delete)\s+WinDefend)/i,
+    riskRule("critical", "defense", "defense_off", "Weakens Windows protection (Defender or firewall).", "Ослабляет защиту Windows (Defender или брандмауэр).")],
+  [/\b(mimikatz|sekurlsa|lsass|reg(\.exe)?\s+save\s+hklm\\+(sam|system|security)|vaultcmd|cmdkey(\.exe)?\s+\/list)\b/i,
+    riskRule("critical", "creds", "credential_dump", "Looks like an attempt to extract saved passwords or credentials.", "Похоже на попытку извлечь сохранённые пароли или учётные данные.")],
+  [/\b(GetAsyncKeyState|SetWindowsHookEx|GetKeyboardState)\b/i,
+    riskRule("critical", "spy", "keylogger", "Can record keystrokes.", "Может записывать нажатия клавиш.")],
+  [/(Invoke-WebRequest|\biwr\b|\bcurl\b|\bwget\b|Invoke-RestMethod|\birm\b|DownloadString|DownloadFile|Net\.WebClient|Start-BitsTransfer)[\s\S]*(\|\s*(iex|Invoke-Expression|powershell|pwsh|cmd)\b|\biex\b|Invoke-Expression)|(\biex\b|Invoke-Expression)[\s\S]*(DownloadString|Invoke-WebRequest|\biwr\b|Invoke-RestMethod|\birm\b)/i,
+    riskRule("critical", "net", "download_exec", "Downloads code from the internet and runs it right away.", "Скачивает код из интернета и сразу запускает его.")],
+  [/(localgroup\s+(administrators|администраторы)\b[^\n]*\/add|Add-LocalGroupMember\b[^\n]*(Administrators|Администраторы))/i,
+    riskRule("critical", "accounts", "admin_grant", "Gives an account administrator rights.", "Выдаёт учётной записи права администратора.")],
+  [/\b(Remove-Item|rm|ri|del|erase|rd|rmdir)\b[^\n|;&]*?(\s-r(ecurse)?\b|\s\/s\b|\s-rf\b)/i,
+    riskRule("high", "delete", "delete_recursive", "Deletes folders together with everything inside.", "Удаляет папки вместе со всем содержимым.")],
+  [/\b(Remove-Item|rm|ri|del|erase)\b[^\n|;&]*?(\s-Force\b|\s\/[fq]\b)/i,
+    riskRule("high", "delete", "delete_force", "Force-deletes files, including hidden and read-only ones.", "Принудительно удаляет файлы, включая скрытые и защищённые от записи.")],
+  [/\b(Remove-Item|ri|rm|del|erase|rd|rmdir)\b/i,
+    riskRule("medium", "delete", "delete", "Deletes files or folders.", "Удаляет файлы или папки.")],
+  [/\bgit\s+(push\b[^\n]*(\s--force\b|\s-f\b|\s--mirror\b|\s--delete\b)|reset\s+--hard|clean\s+-[a-z]*[fdx]|checkout\s+--\s|branch\s+-D\b|filter-branch|reflog\s+expire)/i,
+    riskRule("high", "git", "git_destructive", "Can permanently discard Git history or uncommitted work.", "Может безвозвратно стереть историю Git или незакоммиченные изменения.")],
+  [/\bgit\s+push\b/i,
+    riskRule("medium", "git", "git_push", "Publishes commits to a remote repository.", "Публикует коммиты во внешний репозиторий.")],
+  [/(reg(\.exe)?\s+(add|delete|import|restore|load)\b[^\n]*(HKLM|HKEY_LOCAL_MACHINE)|(Set-ItemProperty|New-ItemProperty|Remove-ItemProperty|New-Item|Remove-Item)\b[^\n|;]*(HKLM:|HKEY_LOCAL_MACHINE))/i,
+    riskRule("high", "registry", "registry_system", "Changes system-wide registry settings.", "Меняет системные параметры реестра.")],
+  [/(reg(\.exe)?\s+(add|delete|import|restore|load)\b|(Set-ItemProperty|New-ItemProperty|Remove-ItemProperty)\b[^\n|;]*HK(CU|LM|CR|U))/i,
+    riskRule("medium", "registry", "registry_user", "Changes registry settings.", "Меняет параметры реестра.")],
+  [/(CurrentVersion\\+Run(Once)?\b|Start Menu\\+Programs\\+Startup|shell:startup|\\Winlogon\b|Image File Execution Options)/i,
+    riskRule("high", "persist", "autorun", "Makes something start automatically with Windows.", "Добавляет автозапуск вместе с Windows.")],
+  [/(schtasks(\.exe)?\s+\/create|Register-ScheduledTask|New-ScheduledTask)/i,
+    riskRule("high", "persist", "scheduled_task", "Creates a scheduled task that runs later, possibly repeatedly.", "Создаёт задачу планировщика, которая запустится позже, возможно многократно.")],
+  [/(New-Service|\bsc(\.exe)?\s+(create|config|delete)\b|Set-Service\b|Stop-Service\b|Remove-Service\b)/i,
+    riskRule("high", "service", "service_change", "Creates, stops or reconfigures a Windows service.", "Создаёт, останавливает или перенастраивает службу Windows.")],
+  [/(Stop-Computer|Restart-Computer|\bshutdown(\.exe)?\b|\blogoff(\.exe)?\b|SetSuspendState|LockWorkStation)/i,
+    riskRule("high", "power", "power", "Shuts down, restarts, locks or logs off the PC.", "Выключает, перезагружает, блокирует ПК или завершает сеанс.")],
+  [/(-Verb\s+RunAs\b|\brunas(\.exe)?\s)/i,
+    riskRule("high", "elevate", "elevation", "Asks Windows for administrator rights.", "Запрашивает у Windows права администратора.")],
+  [/Set-ExecutionPolicy\b(?![^\n]*-Scope\s+Process)/i,
+    riskRule("high", "policy", "execution_policy", "Changes the PowerShell script execution policy.", "Меняет политику запуска сценариев PowerShell.")],
+  [/\s-e(nc|ncodedcommand)?\s+[A-Za-z0-9+\/=]{16,}/i,
+    riskRule("high", "obfuscation", "encoded_command", "Runs an encoded command whose text cannot be reviewed here.", "Запускает закодированную команду: её текст здесь не прочитать.")],
+  [/(net(\.exe)?\s+user\b[^\n]*\/(add|delete)|New-LocalUser|Remove-LocalUser|Set-LocalUser|Disable-LocalUser)/i,
+    riskRule("high", "accounts", "accounts", "Creates or changes Windows user accounts.", "Создаёт или меняет учётные записи Windows.")],
+  [/drivers[\\/]+etc[\\/]+hosts\b/i,
+    riskRule("high", "network", "hosts_file", "Touches the hosts file, which can redirect websites.", "Затрагивает файл hosts, через который можно подменять сайты.")],
+  [/(New-NetFirewallRule|Set-NetFirewallRule|netsh(\.exe)?\s+(advfirewall|firewall)\s+(add|set)\b)/i,
+    riskRule("high", "network", "firewall_rule", "Changes firewall rules.", "Меняет правила брандмауэра.")],
+  [/(Enable-PSRemoting|\bwinrm\s|WSMan:|fDenyTSConnections|OpenSSH\.Server|Start-Service\s+sshd)/i,
+    riskRule("high", "remote", "remote_access", "Turns on remote access to this PC.", "Включает удалённый доступ к этому ПК.")],
+  [/(\btakeown(\.exe)?\b|\bicacls(\.exe)?\b[^\n]*\/(grant|setowner|reset)|Set-Acl\b)/i,
+    riskRule("high", "acl", "permissions_change", "Changes file ownership or access rights.", "Меняет владельца файлов или права доступа к ним.")],
+  [/(wevtutil(\.exe)?\s+cl\b|Clear-EventLog|Remove-EventLog|Clear-History)/i,
+    riskRule("high", "traces", "clear_logs", "Clears Windows event logs or command history.", "Очищает журналы событий Windows или историю команд.")],
+  [/([\\/]\.ssh[\\/]|\bid_(rsa|ed25519|ecdsa|dsa)\b|Login Data|[\\/]Cookies\b|Local State|\.kdbx\b|wallet\.dat|\.aws[\\/]credentials|\.kube[\\/]config|\.git-credentials|\.docker[\\/]config\.json|Microsoft[\\/](Credentials|Protect)\b|Telegram Desktop[\\/]tdata)/i,
+    riskRule("high", "secrets", "secret_files", "Accesses stored keys, passwords or browser data.", "Обращается к ключам, паролям или данным браузера.")],
+  [/(CopyFromScreen|\bBitBlt\b|PrintWindow)/i,
+    riskRule("high", "spy", "screen_capture", "Captures the screen without the screenshot approval card.", "Делает снимок экрана в обход карточки подтверждения скриншота.")],
+  [/(Stop-Process|taskkill(\.exe)?|\bkill\s)[^\n]*\b(explorer|svchost|winlogon|csrss|lsass|wininit|services|smss|dwm)\b/i,
+    riskRule("high", "process", "process_system", "Stops critical Windows processes.", "Останавливает важные процессы Windows.")],
+  [/(Stop-Process|taskkill(\.exe)?|\bkill\s)/i,
+    riskRule("medium", "process", "process_kill", "Stops running programs.", "Останавливает запущенные программы.")],
+  [/((Invoke-WebRequest|Invoke-RestMethod|\biwr\b|\birm\b)\b[^\n|;]*-Method\s+(Post|Put|Patch)|\bcurl(\.exe)?\b[^\n|;]*(\s-d\b|--data|\s-F\b|--form|--upload-file|\s-T\b)|Send-MailMessage|\b(scp|sftp|ftp)(\.exe)?\s)/i,
+    riskRule("medium", "net", "upload", "Sends data from this PC over the network.", "Отправляет данные с этого ПК по сети.")],
+  [/(Invoke-WebRequest|\biwr\b|\bcurl(\.exe)?\s|\bwget\s|Invoke-RestMethod|\birm\b|Start-BitsTransfer|DownloadFile|DownloadString)/i,
+    riskRule("low", "net", "download", "Downloads data from the internet.", "Скачивает данные из интернета.")],
+  [/(winget(\.exe)?\s+(install|upgrade|uninstall)|choco(\.exe)?\s+(install|upgrade|uninstall)|scoop\s+install|msiexec|Install-Module|Install-Package|Add-AppxPackage|npm(\.cmd)?\s+(i|install)\s[^\n]*(-g\b|--global)|pip3?(\.exe)?\s+install|Enable-WindowsOptionalFeature|\bdism(\.exe)?\s)/i,
+    riskRule("medium", "install", "install", "Installs, updates or removes software.", "Устанавливает, обновляет или удаляет программы.")],
+  [/(Get-Clipboard|Set-Clipboard|\bclip(\.exe)?\b|Clipboard\]::)/i,
+    riskRule("medium", "privacy", "clipboard", "Reads or changes the clipboard.", "Читает или меняет буфер обмена.")],
+  [/(\[Environment\]::SetEnvironmentVariable\([^\n)]*(Machine|User)|\bsetx(\.exe)?\s)/i,
+    riskRule("medium", "env", "env_permanent", "Permanently changes environment variables.", "Навсегда меняет переменные среды.")],
+  [/(\biex\b|Invoke-Expression|\[System\.Reflection\.Assembly\]::Load|Add-Type\b[^\n]*DllImport)/i,
+    riskRule("medium", "dynamic", "dynamic_code", "Runs code generated on the fly.", "Выполняет код, собранный на лету.")],
+];
+// A delete aimed at a drive root, the Windows folder or a whole user profile.
+const ROOTISH_DELETE = /\b(Remove-Item|rm|ri|del|erase|rd|rmdir)\b[^\n|;&]*?(\s|['"=])([A-Za-z]:\\?|[A-Za-z]:\\(Windows|Users|Program Files( \(x86\))?|ProgramData)(\\[^\\\s'"]+)?|\$env:(USERPROFILE|HOMEPATH|SystemRoot|windir|ProgramFiles|ProgramData|APPDATA|LOCALAPPDATA)|~)[\\\/]?\*?(?=['"]?(\s|$|;|\|))/i;
+const SENSITIVE_READ = /([\\/]\.ssh[\\/](id_[^\\/]*|[^\\/]*_key|config)$|[\\/](Login Data|Cookies|Web Data|Local State)$|\.kdbx$|wallet\.dat$|[\\/]\.aws[\\/]credentials$|[\\/]\.kube[\\/]config$|[\\/]\.git-credentials$|[\\/]\.docker[\\/]config\.json$|[\\/]Microsoft[\\/](Credentials|Protect)[\\/]|Telegram Desktop[\\/]tdata)/i;
+
+function assessWritePath(fullPath) {
+  const out = [];
+  const p = String(fullPath || "");
+  if (/^[a-z]:\\(windows|program files( \(x86\))?)(\\|$)/i.test(p) || /^[a-z]:\\programdata\\microsoft\\/i.test(p))
+    out.push(riskRule("critical", "location", "system_folder", "Writes into a Windows system or program folder.", "Пишет в системную папку Windows или Program Files."));
+  if (/\\start menu\\programs\\startup\\/i.test(p))
+    out.push(riskRule("high", "persist", "startup_folder", "Puts a file into the Startup folder (runs at every sign-in).", "Кладёт файл в автозагрузку (запускается при каждом входе)."));
+  if (/\\(windowspowershell|powershell)\\[^\\]*profile\.ps1$/i.test(p))
+    out.push(riskRule("high", "persist", "ps_profile", "Changes a PowerShell profile that runs in every new shell.", "Меняет профиль PowerShell, который выполняется в каждом новом окне."));
+  if (/\\drivers\\etc\\hosts$/i.test(p))
+    out.push(riskRule("high", "network", "hosts_file", "Changes the hosts file, which can redirect websites.", "Меняет файл hosts, через который можно подменять сайты."));
+  if (/[\\/]\.ssh[\\/]/i.test(p))
+    out.push(riskRule("high", "secrets", "ssh_dir", "Changes SSH keys or SSH settings.", "Меняет SSH-ключи или настройки SSH."));
+  if (/[\\/]\.git[\\/]hooks[\\/]/i.test(p))
+    out.push(riskRule("high", "persist", "git_hook", "Adds a Git hook that runs code on Git commands.", "Добавляет Git-хук, который запускает код при командах Git."));
+  if (/\.(exe|dll|sys|scr|com|msi|lnk|reg)$/i.test(p))
+    out.push(riskRule("high", "exec", "binary_file", "Creates or replaces a program, shortcut or registry file.", "Создаёт или заменяет программу, ярлык или файл реестра."));
+  else if (/\.(bat|cmd|ps1|psm1|vbs|vbe|jse|wsf|hta)$/i.test(p))
+    out.push(riskRule("medium", "exec", "script_file", "Creates or changes a script that can be run.", "Создаёт или меняет сценарий, который можно запустить."));
+  if (p && !insideDir(canonicalLoose(PROJECT_DIR), canonicalLoose(p)))
+    out.push(riskRule("medium", "location", "outside_project", "Outside the project folder.", "Вне папки проекта."));
+  return out;
+}
+function assessWriteContent(fullPath, content) {
+  const out = [];
+  try {
+    const st = fs.statSync(fullPath);
+    if (st.isFile()) {
+      const newBytes = Buffer.byteLength(String(content ?? ""), "utf8");
+      const pct = st.size > 0 ? Math.round((newBytes / st.size) * 100) : 100;
+      if (st.size > 0 && newBytes === 0) out.push(riskRule("high", "content", "erase_content", "Erases the whole content of an existing file.", "Стирает всё содержимое существующего файла."));
+      else if (st.size > 4096 && newBytes < st.size * 0.2) out.push(riskRule("medium", "content", "shrink", "Replaces most of the file: the new version is " + pct + "% of the current size.", "Заменяет большую часть файла: новая версия — " + pct + "% от текущего размера."));
+    }
+  } catch {}
+  if (/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(String(content || ""))) out.push(riskRule("medium", "secrets", "private_key", "Writes a private key to disk.", "Записывает на диск закрытый ключ."));
+  return out;
+}
+function measureTree(root, capFiles) {
+  let files = 0, bytes = 0;
+  const stack = [root];
+  while (stack.length && files < capFiles) {
+    const dir = stack.pop();
+    let items = [];
+    try { items = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const it of items) {
+      const abs = path.join(dir, it.name);
+      if (it.isDirectory()) stack.push(abs);
+      else { files++; try { bytes += fs.statSync(abs).size; } catch {} if (files >= capFiles) break; }
+    }
+  }
+  return { files, bytes };
+}
+function assessFileOp(args, fullPath, toPath) {
+  const out = [];
+  if (args.op === "delete") {
+    out.push(riskRule("medium", "delete", "trash_delete", "Deletes; the files go to ZeroIDE history and can be restored.", "Удаляет; файлы попадают в историю ZeroIDE, их можно восстановить."));
+    try { if (fs.statSync(fullPath).isDirectory() && measureTree(fullPath, 501).files > 500) out.push(riskRule("high", "delete", "big_delete", "Deletes a folder with more than 500 files.", "Удаляет папку, в которой больше 500 файлов.")); } catch {}
+  } else if ((args.op === "move" || args.op === "copy") && args.overwrite) {
+    out.push(riskRule("medium", "overwrite", "overwrite", "May replace an existing file (its previous version is kept).", "Может заменить существующий файл (прежняя версия сохраняется)."));
+  }
+  if (args.op !== "copy") out.push(...assessWritePath(fullPath));
+  if (toPath) out.push(...assessWritePath(toPath));
+  return out;
+}
+function assessRisk(tool, args) {
+  let rules = [];
+  try {
+    if (tool === "run_command") {
+      const text = String(args.command || "");
+      for (const [re, rule] of COMMAND_RISK_RULES) if (re.test(text)) rules.push(rule);
+      if (ROOTISH_DELETE.test(text)) rules.push(riskRule("critical", "delete", "delete_root", "Deletes a whole drive, the Windows folder or a user profile.", "Удаляет целый диск, папку Windows или профиль пользователя."));
+      if (TRAY_CONTROL_RE.test(text)) rules.push(riskRule("critical", "self", "zeroide_control", "Talks to the ZeroIDE tray control port, where approvals are decided.", "Обращается к управляющему порту трея ZeroIDE, где решаются подтверждения."));
+      // The same secrets reached through the server folder (by path or as the working folder).
+      const lower = text.toLowerCase();
+      const cwdFull = typeof args.cwd === "string" && args.cwd ? resolvePath(args.cwd) : PROJECT_DIR;
+      const selfDirs = [SERVER_DIR, INSTALL_ROOT].filter(Boolean);
+      const nearSelf = selfDirs.some((d) => lower.includes(d.toLowerCase()) || insideDir(canonicalLoose(d), canonicalLoose(cwdFull)));
+      if ((nearSelf && /config\.env|tokens\.json|oauth\.json|tray-config\.json|tunnel_key/i.test(text)) || /\b(MCP_TOKEN|TRAY_CONTROL_SECRET)\b/.test(text))
+        rules.push(riskRule("critical", "self", "zeroide_self", "Touches ZeroIDE MCP's own secrets or approval channel.", "Затрагивает секреты или канал подтверждений самого ZeroIDE MCP."));
+    } else if (tool === "write_file") {
+      const full = resolvePath(args.path);
+      rules = [...assessWritePath(full), ...assessWriteContent(full, args.content)];
+    } else if (tool === "edit_file") {
+      rules = assessWritePath(resolvePath(args.path));
+    } else if (tool === "file_ops") {
+      rules = assessFileOp(args, resolvePath(args.path), args.to ? resolvePath(args.to) : "");
+    } else if (tool === "read_file" || tool === "read_image" || tool === "search_files") {
+      const full = resolvePath(args.path);
+      if (!/\.pub$/i.test(full) && SENSITIVE_READ.test(full)) rules.push(riskRule("high", "secrets", "secret_read", "Reads stored keys, passwords or browser data.", "Читает ключи, пароли или данные браузера."));
+    }
+  } catch {}
+  // One reason per group, the strongest one: "deletes recursively" does not also say "deletes".
+  const best = new Map();
+  for (const r of rules) {
+    const cur = best.get(r.group);
+    if (!cur || RISK_ORDER[r.level] > RISK_ORDER[cur.level]) best.set(r.group, r);
+  }
+  const picked = [...best.values()].sort((a, b) => RISK_ORDER[b.level] - RISK_ORDER[a.level]);
+  return { level: picked.length ? picked[0].level : "low", reasons: picked.slice(0, 6).map((r) => ({ code: r.code, level: r.level, text: tr(r.en, r.ru) })) };
+}
+function riskHeadline(level) {
+  return level === "critical" ? tr("Critical risk: check every word", "Критический риск: проверьте каждое слово")
+    : level === "high" ? tr("High risk: read before allowing", "Высокий риск: прочитайте перед разрешением")
+    : level === "medium" ? tr("Worth a look", "Стоит проверить")
+    : tr("Low risk", "Низкий риск");
+}
+
+// ---- Edits and change previews --------------------------------------------------
+// Applies one edit (oldString/newString) or several (edits[]) in memory, all or nothing.
+function prepareEdit(fullPath, args) {
+  if (!fs.existsSync(fullPath)) return { ok: false, code: "not_found" };
+  const buf = fs.readFileSync(fullPath);
+  const text = buf.toString("utf8");
+  const list = Array.isArray(args.edits) && args.edits.length
+    ? args.edits
+    : typeof args.oldString === "string" ? [{ oldString: args.oldString, newString: args.newString ?? "", replaceAll: args.replaceAll === true }] : [];
+  if (!list.length) return { ok: false, code: "no_edits", buf, text };
+  let updated = text;
+  let replaced = 0;
+  for (let i = 0; i < list.length; i++) {
+    const e = list[i] || {};
+    const oldS = String(e.oldString ?? "");
+    const newS = String(e.newString ?? "");
+    if (!oldS) return { ok: false, code: "empty_old", index: i, buf, text };
+    const parts = updated.split(oldS);
+    const n = parts.length - 1;
+    if (n === 0) return { ok: false, code: "not_found_text", index: i, buf, text };
+    if (n > 1 && e.replaceAll !== true) return { ok: false, code: "ambiguous", index: i, count: n, buf, text };
+    updated = parts.join(newS);
+    replaced += n;
+  }
+  return { ok: true, buf, text, updated, replaced, edits: list.length };
+}
+function editFailureResult(fullPath, prep, total) {
+  const which = total > 1 ? tr(" (edit #", " (правка №") + ((prep.index ?? 0) + 1) + tr(" of ", " из ") + total + tr("; no edit was applied)", "; ни одна правка не применена)") : "";
+  if (prep.code === "not_found") return textResult(tr("ERROR: file not found: ", "ERROR: файл не найден: ") + fullPath, true);
+  if (prep.code === "no_edits") return textResult(tr("ERROR: pass oldString and newString, or a non-empty edits array.", "ERROR: передай oldString и newString или непустой массив edits."), true);
+  if (prep.code === "empty_old") return textResult(tr("DENIED: oldString is empty", "ОТКАЗ: oldString пустой") + which + ".\npath: " + fullPath, true);
+  if (prep.code === "ambiguous")
+    return textResult(
+      [
+        tr("DENIED: oldString occurs ", "ОТКАЗ: oldString встречается ") + prep.count + tr(" times — edit cancelled to avoid changing the wrong place", " раз — правка отменена, чтобы не изменить не то место") + which + ".",
+        "path: " + fullPath,
+        tr("hint: widen oldString so the fragment becomes unique, or pass replaceAll: true for that edit.", "hint: расширь oldString так, чтобы фрагмент стал уникальным, или передай replaceAll: true для этой правки."),
+      ].join("\n"),
+      true
+    );
+  return textResult(
+    [
+      tr("DENIED: oldString not found in the file — nothing changed", "ОТКАЗ: oldString не найден в файле — ничего не изменено") + which + ".",
+      "path: " + fullPath,
+      tr("hint: check spaces, indents and line breaks; the text must match character for character.", "hint: проверь пробелы, отступы и переносы строк; текст должен совпадать посимвольно."),
+    ].join("\n"),
+    true
+  );
+}
+function compactDiff(lines, ctx, maxLines) {
+  const keep = new Array(lines.length).fill(false);
+  lines.forEach((l, i) => {
+    if (l[0] === "+" || l[0] === "-") for (let k = Math.max(0, i - ctx); k <= Math.min(lines.length - 1, i + ctx); k++) keep[k] = true;
+  });
+  const out = [];
+  let gap = false;
+  for (let i = 0; i < lines.length && out.length < maxLines; i++) {
+    if (keep[i]) { out.push(lines[i]); gap = false; }
+    else if (!gap) { out.push("…"); gap = true; }
+  }
+  return out.join("\n");
+}
+function diffSummary(oldText, newText, exists) {
+  const diff = makeUnifiedDiff(oldText, newText, "file");
+  if (!diff.startsWith("--- ")) return { exists, added: 0, removed: 0, text: diff };
+  const lines = diff.split("\n").slice(2);
+  let added = 0, removed = 0;
+  for (const l of lines) { if (l[0] === "+") added++; else if (l[0] === "-") removed++; }
+  return { exists, added, removed, text: clampText(compactDiff(lines, 2, 140), 8 * 1024).text };
+}
+// What the owner sees on the card for a write or an edit: +/- counts and the changed lines.
+function buildChangePreview(tool, args) {
+  try {
+    const full = resolvePath(args.path);
+    if (tool === "write_file") {
+      let oldText = "", exists = false;
+      try {
+        const st = fs.statSync(full);
+        if (st.isFile()) {
+          exists = true;
+          if (st.size > 2 * 1024 * 1024) return { exists, added: 0, removed: 0, text: tr("(file too large for a preview)", "(файл слишком большой для превью)") };
+          oldText = fs.readFileSync(full, "utf8");
+        }
+      } catch {}
+      return diffSummary(oldText, String(args.content ?? ""), exists);
+    }
+    if (tool === "edit_file") {
+      const prep = prepareEdit(full, args);
+      return prep.ok ? diffSummary(prep.text, prep.updated, true) : null;
+    }
+  } catch {}
+  return null;
+}
+
+// ---- File history (undo) -----------------------------------------------------------
+// The previous bytes of every file an agent overwrites, edits, replaces or deletes are
+// kept in HISTORY_DIR (%LOCALAPPDATA%\ZeroIDE-MCP\history by default) instead of a .bak
+// next to the file: projects stay clean and the owner restores any version from
+// Settings -> Changes. index.jsonl is written by the server only; the tray records its own
+// restores in owner.jsonl. MCP_BACKUP_MODE=sidecar|both brings back the .bak copies.
+function historyNewId() {
+  return "chg_" + Date.now().toString(36) + crypto.randomBytes(3).toString("hex");
+}
+function historyDay() {
+  return new Date().toISOString().slice(0, 10);
+}
+function historyKeepCopy(fullPath, id) {
+  try {
+    const st = fs.statSync(fullPath);
+    if (!st.isFile() || st.size > HISTORY_MAX_FILE_BYTES) return null;
+    const dir = path.join(HISTORY_DIR, historyDay());
+    fs.mkdirSync(dir, { recursive: true });
+    const safe = path.basename(fullPath).replace(/[<>:"/\\|?*\u0000-\u001f]/g, "_").slice(-90);
+    const dest = path.join(dir, id + "__" + safe);
+    fs.copyFileSync(fullPath, dest);
+    return dest;
+  } catch {
+    return null;
+  }
+}
+// Keeps the current bytes of fullPath (when it exists) before a change.
+function keepBeforeChange(fullPath, wantBackup) {
+  const id = historyNewId();
+  if (wantBackup === false || !fs.existsSync(fullPath)) return { id, backup: null, sidecar: null };
+  const backup = BACKUP_MODE === "sidecar" ? null : historyKeepCopy(fullPath, id);
+  let sidecar = null;
+  if (BACKUP_MODE !== "history") {
+    try {
+      sidecar = fullPath + ".bak." + new Date().toISOString().replace(/[:.]/g, "").slice(0, 15);
+      fs.copyFileSync(fullPath, sidecar);
+    } catch { sidecar = null; }
+  }
+  return { id, backup, sidecar };
+}
+let historyPruneScheduled = false;
+function historyAppend(entry) {
+  try {
+    fs.mkdirSync(HISTORY_DIR, { recursive: true });
+    fs.appendFileSync(HISTORY_INDEX, JSON.stringify({ v: 1, ts: new Date().toISOString(), ...entry }) + "\n", "utf8");
+  } catch {}
+  if (!historyPruneScheduled) {
+    historyPruneScheduled = true;
+    const t = setTimeout(pruneHistory, 15000);
+    if (t.unref) t.unref();
+  }
+}
+function pruneHistory() {
+  try {
+    const cutoff = Date.now() - HISTORY_RETENTION_DAYS * 86400000;
+    const cutDay = new Date(cutoff).toISOString().slice(0, 10);
+    for (const base of [HISTORY_DIR, path.join(HISTORY_DIR, "trash")]) {
+      let names = [];
+      try { names = fs.readdirSync(base); } catch {}
+      for (const name of names) {
+        if (/^\d{4}-\d{2}-\d{2}$/.test(name) && name < cutDay) {
+          try { fs.rmSync(path.join(base, name), { recursive: true, force: true }); } catch {}
+        }
+      }
+    }
+    if (fs.existsSync(HISTORY_INDEX)) {
+      const lines = fs.readFileSync(HISTORY_INDEX, "utf8").split("\n").filter(Boolean);
+      const kept = lines.filter((l) => { try { return Date.parse(JSON.parse(l).ts) >= cutoff; } catch { return false; } });
+      if (kept.length < lines.length) {
+        const tmp = HISTORY_INDEX + ".tmp-" + process.pid;
+        fs.writeFileSync(tmp, kept.join("\n") + (kept.length ? "\n" : ""), "utf8");
+        fs.renameSync(tmp, HISTORY_INDEX);
+      }
+    }
+  } catch {}
+}
+function movePath(src, dst) {
+  try {
+    fs.renameSync(src, dst);
+  } catch (e) {
+    if (!e || e.code !== "EXDEV") throw e;
+    fs.cpSync(src, dst, { recursive: true, force: false, errorOnExist: true, preserveTimestamps: true });
+    fs.rmSync(src, { recursive: true, force: true });
+  }
+}
+// Places file_ops never deletes, even into history.
+function deleteGuard(fullPath) {
+  const c = canonicalLoose(fullPath);
+  const home = canonicalLoose(os.homedir());
+  const forbidden = [home, canonicalLoose(PROJECT_DIR)];
+  for (const name of ["Desktop", "Documents", "Downloads", "Pictures", "Music", "Videos", "AppData", "OneDrive"]) forbidden.push(canonicalLoose(path.join(os.homedir(), name)));
+  for (const v of [process.env.SystemRoot, process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.ProgramData]) if (v) forbidden.push(canonicalLoose(v));
+  if (/^[a-z]:\\?$/i.test(path.resolve(fullPath)) || path.parse(path.resolve(fullPath)).root === path.resolve(fullPath)) return tr("REFUSED: file_ops never deletes a whole drive.", "ОТКАЗ: file_ops никогда не удаляет диск целиком.");
+  if (forbidden.includes(c)) return tr("REFUSED: this folder is too important to delete through file_ops (profile, a main user folder, Windows, Program Files or the project root). Delete the items inside instead.", "ОТКАЗ: эту папку нельзя удалить через file_ops (профиль, основная папка пользователя, Windows, Program Files или корень проекта). Удаляй содержимое по отдельности.");
+  return null;
+}
+// Cheap checks that make file_ops fail anyway: answered before an approval card is shown,
+// so the owner is never asked about something that cannot happen.
+function fileOpsPrecheck(args) {
+  try {
+    const op = args.op;
+    if (op === "mkdir") return null;
+    const src = resolvePath(args.path);
+    const head = (msg) => [msg, "op: " + op, "path: " + src].join("\n");
+    if (!fs.existsSync(src)) return head(tr("ERROR: path not found.", "ОШИБКА: путь не найден."));
+    if (op === "delete" || op === "move") { const g = deleteGuard(src); if (g) return head(g); }
+    const isDir = fs.statSync(src).isDirectory();
+    if ((op === "delete" || op === "copy") && isDir && !args.recursive) return head(tr("ERROR: this is a folder; pass recursive: true.", "ОШИБКА: это папка; передай recursive: true."));
+    if ((op === "copy" || op === "move") && !args.to) return head(tr("ERROR: pass `to` with the destination path.", "ОШИБКА: передай `to` — путь назначения."));
+    if ((op === "copy" || op === "move") && fs.existsSync(resolvePath(args.to)) && !args.overwrite) return head(tr("DENIED: the destination already exists — nothing changed. Pass overwrite: true to replace it.", "ОТКАЗ: назначение уже существует — ничего не изменено. Передай overwrite: true, чтобы заменить."));
+  } catch {}
+  return null;
+}
+
+// ---- Images ---------------------------------------------------------------------------
+const IMAGE_PASSTHROUGH_BYTES = 1536 * 1024;
+const IMAGE_MAX_SOURCE_BYTES = 64 * 1024 * 1024;
+function sniffImage(buf) {
+  if (buf.length >= 24 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) return { type: "png", mime: "image/png", width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+  if (buf.length >= 4 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return { type: "jpeg", mime: "image/jpeg", ...jpegSize(buf) };
+  if (buf.length >= 10 && buf.toString("ascii", 0, 3) === "GIF") return { type: "gif", mime: "image/gif", width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
+  if (buf.length >= 12 && buf.toString("ascii", 0, 4) === "RIFF" && buf.toString("ascii", 8, 12) === "WEBP") return { type: "webp", mime: "image/webp", width: 0, height: 0 };
+  if (buf.length >= 26 && buf[0] === 0x42 && buf[1] === 0x4d) return { type: "bmp", mime: "image/bmp", width: buf.readInt32LE(18), height: Math.abs(buf.readInt32LE(22)) };
+  if (buf.length >= 8 && buf[0] === 0 && buf[1] === 0 && buf[2] === 1 && buf[3] === 0) return { type: "ico", mime: "image/x-icon", width: buf[6] || 256, height: buf[7] || 256 };
+  return null;
+}
+function jpegSize(buf) {
+  let i = 2;
+  while (i + 9 < buf.length) {
+    if (buf[i] !== 0xff) { i++; continue; }
+    const marker = buf[i + 1];
+    if (marker === 0xd8 || marker === 0x01 || marker === 0xff || (marker >= 0xd0 && marker <= 0xd7)) { i += marker === 0xff ? 1 : 2; continue; }
+    const len = buf.readUInt16BE(i + 2);
+    if (marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc) return { width: buf.readUInt16BE(i + 7), height: buf.readUInt16BE(i + 5) };
+    i += 2 + len;
+  }
+  return { width: 0, height: 0 };
+}
+// Windows: decode, downscale and re-encode with System.Drawing in a child PowerShell.
+// The path travels in an environment variable, so quotes or Cyrillic never break it.
+function psConvertImage(fullPath, maxSize, fmt) {
+  return new Promise((resolve) => {
+    const script = [
+      "$ErrorActionPreference = 'Stop'",
+      "Add-Type -AssemblyName System.Drawing",
+      "$src = [System.Drawing.Image]::FromFile($env:ZIDE_IMG)",
+      "try {",
+      "  $max = [int]$env:ZIDE_MAX",
+      "  $scale = [Math]::Min(1.0, $max / [double][Math]::Max($src.Width, $src.Height))",
+      "  $w = [Math]::Max(1, [int][Math]::Round($src.Width * $scale)); $h = [Math]::Max(1, [int][Math]::Round($src.Height * $scale))",
+      "  $bmp = New-Object System.Drawing.Bitmap($w, $h, [System.Drawing.Imaging.PixelFormat]::Format32bppArgb)",
+      "  $g = [System.Drawing.Graphics]::FromImage($bmp)",
+      "  $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic",
+      "  $g.PixelOffsetMode = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality",
+      "  if ($env:ZIDE_FMT -eq 'jpeg') { $g.Clear([System.Drawing.Color]::White) }",
+      "  $g.DrawImage($src, 0, 0, $w, $h); $g.Dispose()",
+      "  $ms = New-Object System.IO.MemoryStream",
+      "  if ($env:ZIDE_FMT -eq 'jpeg') {",
+      "    $enc = [System.Drawing.Imaging.ImageCodecInfo]::GetImageEncoders() | Where-Object { $_.MimeType -eq 'image/jpeg' }",
+      "    $ep = New-Object System.Drawing.Imaging.EncoderParameters(1)",
+      "    $ep.Param[0] = New-Object System.Drawing.Imaging.EncoderParameter([System.Drawing.Imaging.Encoder]::Quality, [long]85)",
+      "    $bmp.Save($ms, $enc, $ep)",
+      "  } else { $bmp.Save($ms, [System.Drawing.Imaging.ImageFormat]::Png) }",
+      "  $bmp.Dispose()",
+      "  [Console]::Out.Write(('{0}x{1}|{2}x{3}|' -f $src.Width, $src.Height, $w, $h) + [Convert]::ToBase64String($ms.ToArray()))",
+      "} finally { $src.Dispose() }",
+    ].join("\n");
+    let out = "";
+    let err = "";
+    let done = false;
+    const child = spawn("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], {
+      windowsHide: true,
+      env: { ...process.env, ZIDE_IMG: fullPath, ZIDE_MAX: String(maxSize), ZIDE_FMT: fmt },
+    });
+    const finish = (val) => { if (done) return; done = true; clearTimeout(timer); resolve(val); };
+    const timer = setTimeout(() => { try { child.kill(); } catch {} finish({ ok: false, error: "image_timeout" }); }, 30000);
+    child.stdout.on("data", (d) => { out += d.toString("utf8"); });
+    child.stderr.on("data", (d) => { err += d.toString("utf8"); });
+    child.on("error", (e) => finish({ ok: false, error: String((e && e.message) || e) }));
+    child.on("close", (code) => {
+      const m = out.trim().match(/^(\d+)x(\d+)\|(\d+)x(\d+)\|([A-Za-z0-9+/=]+)$/);
+      if (code !== 0 || !m) { finish({ ok: false, error: (err.trim().split(/\r?\n/)[0] || "image_failed").slice(0, 200) }); return; }
+      finish({ ok: true, srcW: +m[1], srcH: +m[2], w: +m[3], h: +m[4], base64: m[5], mime: fmt === "jpeg" ? "image/jpeg" : "image/png" });
+    });
+  });
+}
+
+// ---- System info ------------------------------------------------------------------
+let systemInfoCache = null;
+function runProbe(file, args, useShell) {
+  return new Promise((resolve) => {
+    let out = "";
+    let child;
+    try { child = spawn(file, args, { shell: !!useShell, windowsHide: true }); } catch { resolve(""); return; }
+    let done = false;
+    const finish = (v) => { if (done) return; done = true; clearTimeout(timer); resolve(v); };
+    const timer = setTimeout(() => { try { killTree(child); } catch {} finish(""); }, 6000);
+    child.stdout.on("data", (d) => { out += d.toString("utf8"); });
+    child.stderr.on("data", (d) => { out += d.toString("utf8"); });
+    child.on("error", () => finish(""));
+    child.on("close", (code) => finish(code === 0 || /version|\d+\.\d+/i.test(out) && !/not (recognized|found)|не является|не найден/i.test(out) ? out.trim() : ""));
+  });
+}
+async function collectSystemFacts() {
+  if (systemInfoCache && Date.now() - systemInfoCache.at < 10 * 60000) return systemInfoCache.facts;
+  const probes = IS_WIN
+    ? [["node", "node --version"], ["npm", "npm --version"], ["python", "python --version"], ["git", "git --version"], ["dotnet", "dotnet --list-sdks"], ["java", "java -version"], ["go", "go version"], ["rustc", "rustc --version"], ["docker", "docker --version"], ["winget", "winget --version"], ["pwsh", "pwsh -NoLogo -NoProfile -Command $PSVersionTable.PSVersion.ToString()"]]
+    : [["node", "node --version"], ["npm", "npm --version"], ["python3", "python3 --version"], ["git", "git --version"], ["dotnet", "dotnet --list-sdks"], ["docker", "docker --version"]];
+  const winScript = [
+    "$o = Get-CimInstance Win32_OperatingSystem",
+    "Add-Type -AssemblyName System.Windows.Forms",
+    "$d = [System.Windows.Forms.Screen]::AllScreens | ForEach-Object { '{0}x{1}{2}' -f $_.Bounds.Width, $_.Bounds.Height, $(if ($_.Primary) { ' (primary)' } else { '' }) }",
+    "[Console]::Out.Write((@{ os = $o.Caption; build = $o.BuildNumber; ps = $PSVersionTable.PSVersion.ToString(); displays = @($d) } | ConvertTo-Json -Compress))",
+  ].join("; ");
+  const [toolOut, winOut] = await Promise.all([
+    Promise.all(probes.map(async ([name, cmd]) => [name, await runProbe(cmd, [], true)])),
+    IS_WIN ? runProbe("powershell", ["-NoProfile", "-NonInteractive", "-Command", winScript], false) : Promise.resolve(""),
+  ]);
+  let win = {};
+  try { win = JSON.parse(winOut || "{}"); } catch {}
+  const tools = toolOut
+    .filter(([, v]) => v)
+    .map(([name, v]) => [name, name === "dotnet" ? v.split(/\r?\n/).map((l) => l.split(" ")[0]).filter(Boolean).join(", ") : v.split(/\r?\n/)[0].replace(/^(git version|go version|docker version|python|java version|openjdk version|rustc)\s*/i, "").replace(/"/g, "").trim()]);
+  const disks = [];
+  if (IS_WIN && typeof fs.statfsSync === "function") {
+    for (const letter of "CDEFGHIJKLMNOPQRSTUVWXYZ") {
+      const root = letter + ":\\";
+      try {
+        if (!fs.existsSync(root)) continue;
+        const s = fs.statfsSync(root);
+        disks.push({ root, total: s.blocks * s.bsize, free: s.bavail * s.bsize });
+      } catch {}
+    }
+  }
+  const facts = {
+    os: win.os ? win.os + (win.build ? " (build " + win.build + ")" : "") : os.type() + " " + os.release(),
+    arch: os.arch(),
+    cpu: (os.cpus()[0]?.model || "?").replace(/\s+/g, " ").trim() + " × " + os.cpus().length,
+    memTotal: os.totalmem(),
+    memFree: os.freemem(),
+    uptimeSec: os.uptime(),
+    host: os.hostname(),
+    user: (() => { try { return os.userInfo().username; } catch { return ""; } })(),
+    timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || "",
+    locale: Intl.DateTimeFormat().resolvedOptions().locale || "",
+    powershell: win.ps || "",
+    displays: Array.isArray(win.displays) ? win.displays : win.displays ? [win.displays] : [],
+    disks,
+    tools,
+  };
+  systemInfoCache = { at: Date.now(), facts };
+  return facts;
+}
+const fmtBytes = (n) => (n >= 1073741824 ? (n / 1073741824).toFixed(1) + " GB" : n >= 1048576 ? (n / 1048576).toFixed(1) + " MB" : n >= 1024 ? (n / 1024).toFixed(1) + " KB" : n + " B");
+
+// ---- user_message open link ------------------------------------------------------
+const REVEAL_ONLY_EXT = /\.(exe|com|bat|cmd|ps1|psm1|vbs|vbe|js|jse|wsf|wsh|hta|msi|msp|scr|lnk|reg|cpl|jar|appref-ms|url|pif|application|gadget|msc)$/i;
+function resolveOpenTarget(raw, extra) {
+  const value = String(raw || "").trim();
+  if (!value) return null;
+  if (/^https?:\/\//i.test(value)) return value.length <= 2048 ? { kind: "url", target: value, reveal: false } : { error: tr("URL is longer than 2048 characters", "URL длиннее 2048 символов") };
+  if (/^[a-z][a-z0-9+.-]*:\/\//i.test(value)) return { error: tr("only http(s) links and local paths can be opened", "открывать можно только ссылки http(s) и локальные пути") };
+  const conf = extra?.confinement;
+  let full = resolvePath(value);
+  if (conf && conf.root) {
+    const chk = confineTargetPath(conf.root, value);
+    if (!chk.ok) return { error: tr("the path is outside the allowed folder", "путь вне разрешённой папки") };
+    full = chk.resolved;
+  }
+  if (selfProtection(full, "read") === "secret") return { error: tr("protected ZeroIDE file", "защищённый файл ZeroIDE") };
+  let st;
+  try { st = fs.statSync(full); } catch { return { error: tr("path not found", "путь не найден") }; }
+  const isDir = st.isDirectory();
+  return { kind: isDir ? "folder" : "file", target: full, reveal: !isDir && REVEAL_ONLY_EXT.test(full) };
+}
+
 /* ---------------------- permissions & approvals (v0.2) ------------------- */
 
 const DEFAULT_PERMISSIONS = {
@@ -678,9 +1345,23 @@ const DEFAULT_PERMISSIONS = {
     audit_log: { mode: "allow" },
     journal_log: { mode: "allow" },
     journal_entry: { mode: "allow" },
+    agent_message: { mode: "allow" },
+    await_owner: { mode: "deny" },
+    system_info: { mode: "allow" },
+    read_image: { mode: "ask" },
     write_file: { mode: "ask" },
     edit_file: { mode: "ask" },
+    file_ops: { mode: "ask" },
     run_command: { mode: "ask" },
+  },
+  // v0.5: what the risk assessment may change. askAtOrAbove turns an "allow" rule into
+  // a prompt for calls at that level; grantsNeverCover keeps tool-wide temporary grants
+  // from passing calls at that level; sensitiveReads asks before reading keys/passwords.
+  riskGate: {
+    enabled: true,
+    askAtOrAbove: "high",
+    grantsNeverCover: "critical",
+    sensitiveReads: true,
   },
   redFlags: {
     enabled: true,
@@ -718,6 +1399,7 @@ function loadPermissions() {
       ...parsed,
       tools: { ...DEFAULT_PERMISSIONS.tools, ...(parsed.tools || {}) },
       redFlags: { ...DEFAULT_PERMISSIONS.redFlags, ...(parsed.redFlags || {}) },
+      riskGate: { ...DEFAULT_PERMISSIONS.riskGate, ...(parsed.riskGate || {}) },
     };
     cachedPermissionsMtimeMs = st.mtimeMs;
     return cachedPermissions;
@@ -1150,6 +1832,11 @@ const TOOL_TITLES_RU = {
   take_screenshot: tr("Screenshot", "Скриншот"),
   user_message: tr("Agent message", "Сообщение агента"),
   task_status: tr("Task status", "Статус задачи"),
+  agent_message: tr("Agent messenger", "Мессенджер агентов"),
+  await_owner: tr("Standby for owner (5 min)", "Ожидание владельца (5 мин)"),
+  read_image: tr("View image", "Просмотр изображения"),
+  file_ops: tr("File operation", "Операция с файлами"),
+  system_info: tr("System info", "Сведения о системе"),
 };
 
 function buildApprovalSummary(tool, cleanArgs) {
@@ -1172,9 +1859,21 @@ function buildApprovalSummary(tool, cleanArgs) {
     detail = `${bytes} bytes${cleanArgs.dryRun ? " (dryRun)" : ""}`;
   } else if (tool === "edit_file") {
     target = resolvePath(cleanArgs.path || "");
-    const oldLen = String(cleanArgs.oldString || "").split("\n").length;
-    const newLen = String(cleanArgs.newString || "").split("\n").length;
-    detail = tr("replace " + oldLen + " lines → " + newLen + " lines", "замена " + oldLen + " стр. → " + newLen + " стр.");
+    if (Array.isArray(cleanArgs.edits) && cleanArgs.edits.length) {
+      detail = tr(cleanArgs.edits.length + " edits in one atomic change", cleanArgs.edits.length + " правок одним атомарным изменением");
+    } else {
+      const oldLen = String(cleanArgs.oldString || "").split("\n").length;
+      const newLen = String(cleanArgs.newString || "").split("\n").length;
+      detail = tr("replace " + oldLen + " lines → " + newLen + " lines", "замена " + oldLen + " стр. → " + newLen + " стр.");
+    }
+  } else if (tool === "file_ops") {
+    const op = String(cleanArgs.op || "");
+    const opText = { copy: tr("Copy", "Копировать"), move: tr("Move", "Переместить"), delete: tr("Delete (to history)", "Удалить (в историю)"), mkdir: tr("Create folder", "Создать папку") }[op] || op;
+    target = resolvePath(cleanArgs.path || "") + (cleanArgs.to ? "  →  " + resolvePath(cleanArgs.to) : "");
+    detail = opText + (cleanArgs.overwrite ? tr(" · overwrite", " · с заменой") : "") + (cleanArgs.recursive ? tr(" · with contents", " · с содержимым") : "");
+  } else if (tool === "read_image") {
+    target = resolvePath(cleanArgs.path || "");
+    detail = tr("The picture will be shared with the model", "Изображение будет передано модели");
   } else if (cleanArgs && typeof cleanArgs.path === "string") {
     target = resolvePath(cleanArgs.path);
     detail = cleanArgs.query ? tr("query: " + cleanArgs.query, "запрос: " + cleanArgs.query) : "";
@@ -1282,15 +1981,322 @@ function postTrayJson(path, payload, timeoutMs = 3000) {
   });
 }
 
-let lastUserMessageAt = 0;
+/* -------- multi-agent registry + instant owner-to-agent messaging -------- */
+// Per-boot in-memory stamp passed in SERVER_INSTRUCTIONS so the model knows
+//PAUSED_BY_OWNER / INTERRUPTED_BY_OWNER messages come from the real tray UI,
+// never from an external file on disk.
+const OWNER_AUTH_TAG = "ZIDE-" + crypto.randomBytes(3).toString("hex").toUpperCase();
+
+// Keyed by normalized agentId (e.g. "claude-landing", "backend-fixer", "legacy").
+const agentRegistry = new Map();
+// Maps callerId ("legacy", "tok_xxx") -> most recent agentId used by that token,
+// so calls that omit `agent` still attach to the right agent slot.
+const lastAgentByCaller = new Map();
+
+function normalizeAgentId(raw) {
+  const s = String(raw || "").trim().slice(0, 64);
+  if (!s) return "";
+  return s.toLowerCase().replace(/\s+/g, "-");
+}
+
+function resolveAgentSlot(sessionRef, explicitAgent) {
+  const caller = sessionRef?.caller || LEGACY_CALLER;
+  const callerKey = caller.id || "legacy";
+  const tokenLabel = caller.label || "legacy";
+  const explicitClean = String(explicitAgent || "").trim().slice(0, 64);
+  if (explicitClean) {
+    sessionRef.agentName = explicitClean;
+  }
+  let agentName =
+    explicitClean ||
+    sessionRef?.agentName ||
+    lastAgentByCaller.get(callerKey) ||
+    (tokenLabel !== "legacy" ? tokenLabel : sessionRef?.clientName || "AI-агент");
+  const agentId = normalizeAgentId(agentName) || "default";
+  lastAgentByCaller.set(callerKey, agentName);
+
+  let slot = agentRegistry.get(agentId);
+  if (!slot) {
+    slot = {
+      agentId,
+      agentName,
+      tokenLabel,
+      callerKey,
+      title: "",
+      current: "",
+      done: [],
+      next: [],
+      taskState: "running", // "running" | "done" | "waiting"
+      startedAt: "",
+      completedAt: "",
+      updatedAt: "",
+      lastTool: "",
+      lastSeenAt: new Date().toISOString(),
+      callsSinceTaskStatus: 0,
+      totalCalls: 0,
+      hasEverSetTask: false,
+      hasEverSentUserMessage: false,
+      lastTaskStatusAtMs: 0,
+      lastUserMessageAtMs: 0,
+      userMessageText: "",
+      userMessageKind: "status",
+      userMessageId: "",
+      standbyUntilMs: 0,
+      standbyActiveCalls: 0,
+      standbyPulseGraceUntilMs: 0,
+      standbyReleased: false,
+    };
+    agentRegistry.set(agentId, slot);
+  } else {
+    if (explicitClean) slot.agentName = explicitClean;
+    slot.tokenLabel = tokenLabel;
+    slot.lastSeenAt = new Date().toISOString();
+  }
+  return slot;
+}
+
+// Queue of owner / peer messages waiting to intercept an agent.
+const ownerMessageQueue = [];
+const ownerMessageListeners = new Set();
+// Unified dialogue log between agents and the PC owner shown in the tray chat card.
+const chatHistory = [];
+// When true (toggled manually by the PC owner in the tray UI), the server instructs
+// finishing agents to call await_owner and wait 5 minutes in the tray before closing.
+let holdAfterTask = false;
+
+function pushChatHistory(entry) {
+  chatHistory.push({
+    id: entry.id || "chat_" + crypto.randomUUID().slice(0, 8),
+    role: entry.role || "agent", // "agent" | "owner"
+    agent: entry.agent || "AI-агент",
+    text: String(entry.text || "").trim().slice(0, 500),
+    kind: entry.kind || "status",
+    status: entry.status || "done",
+    jobId: entry.jobId || null,
+    ts: entry.ts || new Date().toISOString(),
+  });
+  while (chatHistory.length > 30) chatHistory.shift();
+}
+
+function notifyOwnerListeners() {
+  for (const listener of Array.from(ownerMessageListeners)) {
+    try { listener(); } catch {}
+  }
+}
+
+function messageMatchesSlot(msg, slot) {
+  if (!msg || msg.status !== "queued") return false;
+  const target = foldCase(String(msg.to || "*").trim());
+  if (!target || target === "*" || target === "all") return true;
+  if (!slot) return false;
+  if (
+    target === foldCase(slot.agentId) ||
+    target === foldCase(slot.agentName) ||
+    target === foldCase(slot.tokenLabel)
+  ) {
+    return true;
+  }
+  // If the owner sent a message from the tray while another tab under the same
+  // token/caller is idle, deliver it to the actively running agent on this PC
+  // instead of stranding the message on an inactive tab.
+  if (msg.from === "owner") {
+    const targetSlot =
+      agentRegistry.get(normalizeAgentId(msg.to)) ||
+      Array.from(agentRegistry.values()).find(
+        (a) => foldCase(a.agentName) === target || foldCase(a.agentId) === target
+      );
+    if (!targetSlot || targetSlot.callerKey === slot.callerKey) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function enqueueOwnerMessage({ to = "*", text, stopCommand = false, from = "owner" }) {
+  const cleanText = String(text || "").trim().slice(0, 2000);
+  if (!cleanText) return null;
+  const msg = {
+    id: "omsg_" + crypto.randomUUID().slice(0, 8),
+    to: String(to || "*").trim() || "*",
+    text: cleanText,
+    stopCommand: Boolean(stopCommand),
+    from: from === "owner" ? "owner" : String(from).trim().slice(0, 64),
+    authTag: from === "owner" ? OWNER_AUTH_TAG : null,
+    status: "queued",
+    createdAt: new Date().toISOString(),
+    deliveredAt: null,
+    deliveredTo: null,
+    deliveryMode: null,
+    jobId: null,
+  };
+  ownerMessageQueue.push(msg);
+  while (ownerMessageQueue.length > 50) ownerMessageQueue.shift();
+  pushChatHistory({
+    id: msg.id,
+    role: "owner",
+    agent: msg.to === "*" ? "Всем" : msg.to,
+    text: msg.text,
+    status: "queued",
+    ts: msg.createdAt,
+  });
+  audit({
+    event: "owner_message.queued",
+    id: msg.id,
+    to: msg.to,
+    from: msg.from,
+    stopCommand: msg.stopCommand,
+    ok: true,
+  });
+  notifyOwnerListeners();
+  return msg;
+}
+
+function matchAndClaimMessage(slot, deliveryMode) {
+  for (const msg of ownerMessageQueue) {
+    if (messageMatchesSlot(msg, slot)) {
+      msg.status = "delivered";
+      msg.deliveredAt = new Date().toISOString();
+      msg.deliveredTo = slot ? slot.agentName : "agent";
+      msg.deliveryMode = deliveryMode;
+      const ch = chatHistory.find((c) => c.id === msg.id);
+      if (ch) {
+        ch.status = "delivered";
+        ch.agent = msg.deliveredTo;
+      }
+      audit({
+        event: "owner_message.delivered",
+        id: msg.id,
+        to: msg.deliveredTo,
+        from: msg.from,
+        mode: deliveryMode,
+        ok: true,
+      });
+      return msg;
+    }
+  }
+  return null;
+}
+
+function createAgentMessageWaiter(slot, deliveryMode) {
+  let cleanup = () => {};
+  const promise = new Promise((resolve) => {
+    const immediate = matchAndClaimMessage(slot, deliveryMode);
+    if (immediate) {
+      resolve(immediate);
+      return;
+    }
+    const onCheck = () => {
+      const hit = matchAndClaimMessage(slot, deliveryMode);
+      if (hit) {
+        ownerMessageListeners.delete(onCheck);
+        resolve(hit);
+      }
+    };
+    ownerMessageListeners.add(onCheck);
+    cleanup = () => ownerMessageListeners.delete(onCheck);
+  });
+  return { promise, cleanup: () => cleanup() };
+}
+
+function formatSenderHeader(msg) {
+  if (msg.from === "owner") {
+    return `[ZEROIDE-OWNER-AUTH: ${msg.authTag || OWNER_AUTH_TAG}]`;
+  }
+  return `[PEER-AGENT-MESSAGE from="${msg.from}"]`;
+}
+
+function formatPausedByOwnerResult(msg, toolName, slot) {
+  const header = formatSenderHeader(msg);
+  return textResult(
+    [
+      `PAUSED_BY_OWNER ${header}`,
+      `paused_tool: ${toolName}`,
+      `agent: ${slot.agentName}`,
+      tr(
+        `status: paused_before_execution (the call to ${toolName} was NOT executed yet because a live message arrived for you in ZeroIDE MCP).`,
+        `status: paused_before_execution (вызов ${toolName} ещё НЕ выполнялся, так как для тебя пришло живое сообщение в ZeroIDE MCP).`
+      ),
+      "--- message ---",
+      msg.text,
+      "--- next_action ---",
+      tr(
+        `1. Read and follow the message above (${header} confirms it comes from the ZeroIDE MCP supervisor, not from any file).`,
+        `1. Прочитай и учти сообщение выше (штамп ${header} подтверждает, что это сообщение из шлюза ZeroIDE MCP, а не содержимое файла).`
+      ),
+      tr(
+        `2. Acknowledge receipt via user_message({ agent: "${slot.agentName}", text: "...", kind: "status" }) and update task_status if your plan changed.`,
+        `2. Подтверди получение через user_message({ agent: "${slot.agentName}", text: "...", kind: "status" }) и обнови task_status, если план изменился.`
+      ),
+      tr(
+        `3. If the paused call (${toolName}) does NOT conflict with the message above and is still needed, simply call ${toolName} again now.`,
+        `3. Если приостановленный вызов (${toolName}) НЕ противоречит сообщению выше и всё ещё нужен — просто вызови ${toolName} повторно прямо сейчас.`
+      ),
+    ].join("\n")
+  );
+}
+
+function formatInterruptedCommandResult(msg, jobId, command, stopped, slot) {
+  const header = formatSenderHeader(msg);
+  if (stopped) {
+    return textResult(
+      [
+        `INTERRUPTED_BY_OWNER ${header}`,
+        `status: stopped_by_owner`,
+        `agent: ${slot.agentName}`,
+        `command: ${command}`,
+        tr(
+          "message: The PC owner stopped the running command and sent you a direct message from the ZeroIDE tray.",
+          "message: Владелец ПК остановил выполнявшуюся команду и прислал тебе прямое сообщение из трея ZeroIDE."
+        ),
+        "--- message ---",
+        msg.text,
+        "--- next_action ---",
+        tr(
+          `1. Follow the owner's message above immediately and update task_status / user_message({ agent: "${slot.agentName}", ... }).`,
+          `1. Немедленно выполни указание владельца выше и обнови task_status / user_message({ agent: "${slot.agentName}", ... }).`
+        ),
+      ].join("\n")
+    );
+  }
+  return textResult(
+    [
+      `INTERRUPTED_BY_OWNER ${header}`,
+      `status: running`,
+      `job_id: ${jobId}`,
+      `agent: ${slot.agentName}`,
+      `command: ${command}`,
+      tr(
+        `message: The PC owner sent you a live message while this command was running. The command was NOT killed — it continues running in the background under job_id: ${jobId}.`,
+        `message: Владелец ПК прислал тебе сообщение во время работы команды. Команда НЕ прервана — она переведена в фон и продолжает выполняться под job_id: ${jobId}.`
+      ),
+      "--- message ---",
+      msg.text,
+      "--- next_action ---",
+      tr(
+        `1. Read and follow the owner's message above (${header}).`,
+        `1. Прочитай и учти сообщение владельца выше (${header}).`
+      ),
+      tr(
+        `2. Acknowledge via user_message({ agent: "${slot.agentName}", text: "...", kind: "status" }) and update task_status if needed.`,
+        `2. Подтверди получение через user_message({ agent: "${slot.agentName}", text: "...", kind: "status" }) и обнови task_status при необходимости.`
+      ),
+      tr(
+        `3. Your command is still running under job_id="${jobId}": check it with job_status({ jobId: "${jobId}", waitSec: 30 }) or fetch output with job_output({ jobId: "${jobId}" }).`,
+        `3. Твоя команда продолжает работу в фоне под job_id="${jobId}": проверь её через job_status({ jobId: "${jobId}", waitSec: 30 }) или забери вывод через job_output({ jobId: "${jobId}" }).`
+      ),
+    ].join("\n")
+  );
+}
+
 async function handleUserMessage(args, extra) {
   const text = String(args.text || "").trim().slice(0, 500);
   const kind = ["status", "request", "warning"].includes(args.kind) ? args.kind : "status";
   const persistent = args.persistent !== false;
   const id = String(args.id || "").slice(0, 64);
   const caller = extra?.caller || LEGACY_CALLER;
+  const slot = extra?.agentSlot || resolveAgentSlot({ caller }, args.agent);
   if ((extra?.mode || "ask") === "deny") {
-    audit({ tool: "user_message", kind, persistent, id, ok: false, reason: "TOOL_DENIED_BY_MODE" });
+    audit({ tool: "user_message", agent: slot.agentName, kind, persistent, id, ok: false, reason: "TOOL_DENIED_BY_MODE" });
     return textResult(
       [
         tr("DENIED [TOOL_DENIED]: the PC owner disabled agent messages (Settings → Tools).", "ОТКАЗ [TOOL_DENIED]: владелец ПК отключил сообщения агента (Настройки → Инструменты)."),
@@ -1301,26 +2307,59 @@ async function handleUserMessage(args, extra) {
   }
   if (caller.entry) bumpTokenUsage(caller.entry);
   const now = Date.now();
-  if (now - lastUserMessageAt < 1000) {
+  // Per-agent rate limit (was global, which caused parallel agents to drop each other's messages).
+  if (now - slot.lastUserMessageAtMs < 600) {
     return textResult(
-      tr("User message skipped (rate limit: one per second). The previous message is still shown.", "Сообщение пользователю пропущено (лимит: одно в секунду). Предыдущее сообщение ещё показано.")
+      tr("User message skipped (rate limit: one per 0.6s per agent). The previous message is still shown.", "Сообщение пользователю пропущено (лимит: одно в 0.6 с на агента). Предыдущее сообщение ещё показано.")
     );
   }
-  lastUserMessageAt = now;
-  const res = await postTrayJson("/message/show", { text, kind, persistent, id });
-  audit({ tool: "user_message", kind, persistent, id, ok: res.ok });
-  if (!res.ok) {
-    return textResult(
-      tr("User message NOT shown: the tray app is unreachable (" + (res.error || "HTTP " + res.status) + ").", "Сообщение пользователю НЕ показано: приложение в трее недоступно (" + (res.error || "HTTP " + res.status) + ").")
-    );
+  slot.lastUserMessageAtMs = now;
+  slot.hasEverSentUserMessage = true;
+  slot.userMessageText = text;
+  slot.userMessageKind = kind;
+  slot.userMessageId = id;
+  if (text) {
+    pushChatHistory({
+      role: "agent",
+      agent: slot.agentName,
+      text,
+      kind,
+      status: "done",
+    });
   }
-  return textResult(
-    text === ""
+  // v0.5: an optional one-click link (http(s) URL, file or folder). Nothing opens by itself;
+  // programs and scripts are only revealed in Explorer, never launched from the button.
+  const openInfo = text ? resolveOpenTarget(args.open, extra) : null;
+  const open = openInfo && !openInfo.error ? openInfo : undefined;
+  const res = await postTrayJson("/message/show", {
+    text,
+    kind,
+    persistent,
+    id,
+    agent: slot.agentName,
+    agentId: slot.agentId,
+    open,
+  });
+  audit({ tool: "user_message", agent: slot.agentName, kind, persistent, id, ok: res.ok, open: open ? open.kind : undefined });
+  let replyText = !res.ok
+    ? tr("User message NOT shown: the tray app is unreachable (" + (res.error || "HTTP " + res.status) + ").", "Сообщение пользователю НЕ показано: приложение в трее недоступно (" + (res.error || "HTTP " + res.status) + ").")
+    : text === ""
       ? tr("User message cleared.", "Сообщение пользователю очищено.")
-      : tr("User message shown in the tray.", "Сообщение пользователю показано в трее.")
-  );
+      : tr("User message shown in the tray.", "Сообщение пользователю показано в трее.");
+  if (res.ok && open) replyText += "\n" + (open.reveal ? tr("The message has a \"Show in folder\" button for ", "В сообщении есть кнопка «Показать в папке» для ") : tr("The message has an \"Open\" button for ", "В сообщении есть кнопка «Открыть» для ")) + open.target;
+  else if (res.ok && openInfo && openInfo.error) replyText += "\n" + tr("open was ignored: ", "open не прикреплён: ") + openInfo.error;
+  return textResult(replyText);
 }
-let lastTaskStatusAt = 0;
+
+function isAwaitOwnerEnabled() {
+  try {
+    const perms = loadPermissions();
+    const mode = (perms.tools && perms.tools.await_owner && perms.tools.await_owner.mode) || "deny";
+    return mode !== "deny";
+  } catch {
+    return false;
+  }
+}
 
 async function handleTaskStatus(args, extra) {
   const title = String(args.title || "").trim().slice(0, 120);
@@ -1330,9 +2369,9 @@ async function handleTaskStatus(args, extra) {
   const startedAtRaw = String(args.startedAt || "");
   const startedAt = startedAtRaw && !Number.isNaN(Date.parse(startedAtRaw)) ? startedAtRaw : "";
   const caller = extra?.caller || LEGACY_CALLER;
-  const agent = String(args.agent || "").trim().slice(0, 64) || (caller.label || "legacy");
+  const slot = extra?.agentSlot || resolveAgentSlot({ caller }, args.agent);
   if ((extra?.mode || "ask") === "deny") {
-    audit({ tool: "task_status", title, ok: false, reason: "TOOL_DENIED_BY_MODE" });
+    audit({ tool: "task_status", agent: slot.agentName, title, ok: false, reason: "TOOL_DENIED_BY_MODE" });
     return textResult(
       [
         tr("DENIED [TOOL_DENIED]: the PC owner disabled task status (Settings → Tools).", "ОТКАЗ [TOOL_DENIED]: владелец ПК отключил статус задачи (Настройки → Инструменты)."),
@@ -1343,23 +2382,284 @@ async function handleTaskStatus(args, extra) {
   }
   if (caller.entry) bumpTokenUsage(caller.entry);
   const now = Date.now();
-  if (now - lastTaskStatusAt < 1000) {
+  let resolvedState = "running";
+  const rawStatus = String(args.status || "").trim().toLowerCase();
+  if (rawStatus === "done" || rawStatus === "completed") {
+    resolvedState = "done";
+  } else if (rawStatus === "waiting") {
+    resolvedState = "waiting";
+  } else if (
+    title &&
+    next.length === 0 &&
+    (/^(готово|выполнено|завершено|done|completed|finished)\b/i.test(current) ||
+      /^(готово|выполнено|завершено|done|completed|finished)\b/i.test(title))
+  ) {
+    resolvedState = "done";
+  }
+  // Never drop a final 'done' transition or explicit clear due to the 0.6s rate limit.
+  const isStateTransition = (resolvedState === "done" && slot.taskState !== "done") || title === "";
+  if (!isStateTransition && now - slot.lastTaskStatusAtMs < 600) {
     return textResult(
-      tr("Task status skipped (rate limit: one per second). The previous status is still shown.", "Статус задачи пропущен (лимит: один в секунду). Предыдущий статус ещё показан.")
+      tr("Task status skipped (rate limit: one per 0.6s per agent). The previous status is still shown.", "Статус задачи пропущен (лимит: один в 0.6 с на агента). Предыдущий статус ещё показан.")
     );
   }
-  lastTaskStatusAt = now;
-  const res = await postTrayJson("/task/show", { title, current, done, next, startedAt, agent });
-  audit({ tool: "task_status", title, ok: res.ok });
-  if (!res.ok) {
+
+  slot.lastTaskStatusAtMs = now;
+  slot.title = title;
+  slot.current = current;
+  slot.done = done;
+  slot.next = next;
+  slot.taskState = resolvedState;
+  if (startedAt) slot.startedAt = startedAt;
+  else if (title && !slot.startedAt) slot.startedAt = new Date().toISOString();
+  if (!title) {
+    slot.startedAt = "";
+    slot.completedAt = "";
+    slot.taskState = "running";
+    slot.standbyUntilMs = 0;
+    slot.standbyPulseGraceUntilMs = 0;
+  } else if (resolvedState === "done") {
+    if (!slot.completedAt) slot.completedAt = new Date().toISOString();
+    // Do NOT fake a standby countdown here — countdown is active ONLY while await_owner is genuinely open.
+  } else {
+    slot.completedAt = "";
+    slot.standbyUntilMs = 0;
+    slot.standbyPulseGraceUntilMs = 0;
+  }
+  slot.updatedAt = new Date().toISOString();
+  slot.hasEverSetTask = Boolean(title);
+  slot.callsSinceTaskStatus = 0;
+
+  const res = await postTrayJson("/task/show", {
+    title,
+    current,
+    done,
+    next,
+    status: slot.taskState,
+    startedAt: slot.startedAt,
+    completedAt: slot.completedAt,
+    agent: slot.agentName,
+    agentId: slot.agentId,
+  });
+  audit({ tool: "task_status", agent: slot.agentName, agentId: slot.agentId, title, status: slot.taskState, ok: res.ok });
+  let replyText = !res.ok
+    ? tr("Task status NOT shown: the tray app is unreachable (" + (res.error || "HTTP " + res.status) + ").", "Статус задачи НЕ показан: приложение в трее недоступно (" + (res.error || "HTTP " + res.status) + ").")
+    : title === ""
+      ? tr("Task status cleared for agent " + slot.agentName + ".", "Статус задачи очищен для агента " + slot.agentName + ".")
+      : resolvedState === "done"
+        ? (() => {
+            const standbyAllowed = isAwaitOwnerEnabled();
+            const holdActive = standbyAllowed && holdAfterTask;
+            return tr(
+              `Task marked as DONE in the tray (agent: ${slot.agentName}).` +
+              (!slot.hasEverSentUserMessage ? `\n- Also call user_message({ agent: "${slot.agentName}", text: "...", kind: "status" }) so the owner sees your final summary in the tray.` : "") +
+              (holdActive
+                ? `\n- [HOLD_AFTER_TASK_ENABLED_BY_OWNER]: The PC owner manually turned ON the 'Hold agent 5 min' switch in the ZeroIDE tray right now (they may not have access to the chat window). Do NOT end your turn in chat — call await_owner({ agent: "${slot.agentName}", summary: "..." }) immediately and wait in the tray!`
+                : standbyAllowed
+                  ? `\n- If the owner specifically asked you to stay connected via tray (or chat UI is unavailable), call await_owner({ agent: "${slot.agentName}", summary: "..." }); otherwise reply normally in chat.`
+                  : ""),
+              `Задача отмечена как ВЫПОЛНЕННАЯ в трее (агент: ${slot.agentName}).` +
+              (!slot.hasEverSentUserMessage ? `\n- Также отправь краткий итог через user_message({ agent: "${slot.agentName}", text: "...", kind: "status" }), чтобы владелец увидел результат в окне трея.` : "") +
+              (holdActive
+                ? `\n- [HOLD_AFTER_TASK_ENABLED_BY_OWNER]: Владелец ПК прямо сейчас вручную включил тумблер «Удерживать 5 мин» в трее ZeroIDE (возможно, у него нет доступа к окну чата). НЕ завершай ход в чате — обязательно вызови user_message с итогом и сразу вызови await_owner({ agent: "${slot.agentName}", summary: "..." }) для ожидания в трее!`
+                : standbyAllowed
+                  ? `\n- Если владелец просил ждать в трее (или веб-чат недоступен), вызови await_owner({ agent: "${slot.agentName}", summary: "..." }); иначе отвечай в чат как обычно.`
+                  : "")
+            );
+          })()
+        : tr("Task status shown in the tray (agent: " + slot.agentName + ").", "Статус задачи показан в трее (агент: " + slot.agentName + ").");
+  return textResult(replyText);
+}
+
+const STANDBY_PULSE_MS = 45000; // 45s per pulse (< 60s cloud proxy timeout)
+
+async function handleAwaitOwner(args, extra) {
+  const caller = extra?.caller || LEGACY_CALLER;
+  const slot = extra?.agentSlot || resolveAgentSlot({ caller }, args.agent);
+  const summary = String(args.summary || "").trim().slice(0, 500);
+  const continueStandby = Boolean(args.continueStandby);
+  const waitMinutes = Math.min(Math.max(Number(args.waitMinutes) || 5, 0.1), 30);
+
+  if (!continueStandby || !slot.standbyUntilMs || slot.standbyUntilMs <= Date.now()) {
+    slot.standbyUntilMs = Date.now() + Math.round(waitMinutes * 60 * 1000);
+    slot.standbyReleased = false;
+    if (slot.title) {
+      slot.taskState = "done";
+      if (!slot.completedAt) slot.completedAt = new Date().toISOString();
+    }
+    if (summary) {
+      slot.userMessageText = summary;
+      slot.userMessageKind = "request";
+      slot.hasEverSentUserMessage = true;
+      pushChatHistory({
+        role: "agent",
+        agent: slot.agentName,
+        text: summary,
+        kind: "request",
+        status: "done",
+      });
+      await postTrayJson("/message/show", {
+        text: summary,
+        kind: "request",
+        persistent: true,
+        id: "standby",
+        agent: slot.agentName,
+        agentId: slot.agentId,
+      });
+    }
+  }
+
+  const pulseEndMs = Math.min(slot.standbyUntilMs, Date.now() + STANDBY_PULSE_MS);
+  const waiter = createAgentMessageWaiter(slot, "standby_reply");
+  let claimedMsg = null;
+  let pollTimer = null;
+  slot.standbyActiveCalls += 1;
+  slot.standbyPulseGraceUntilMs = 0;
+  try {
+    const raced = await Promise.race([
+      waiter.promise.then((m) => ({ type: "msg", msg: m })),
+      new Promise((resolve) => {
+        pollTimer = setInterval(() => {
+          if (slot.standbyReleased || Date.now() >= pulseEndMs) {
+            clearInterval(pollTimer);
+            resolve({ type: "tick" });
+          }
+        }, 150);
+      }),
+    ]);
+    if (raced && raced.type === "msg" && raced.msg) {
+      claimedMsg = raced.msg;
+    }
+  } finally {
+    slot.standbyActiveCalls = Math.max(0, slot.standbyActiveCalls - 1);
+    if (pollTimer) clearInterval(pollTimer);
+    waiter.cleanup();
+  }
+
+  if (claimedMsg) {
+    slot.standbyUntilMs = 0;
+    slot.standbyPulseGraceUntilMs = 0;
+    slot.taskState = "running";
+    slot.completedAt = "";
+    const hdr = formatSenderHeader(claimedMsg);
     return textResult(
-      tr("Task status NOT shown: the tray app is unreachable (" + (res.error || "HTTP " + res.status) + ").", "Статус задачи НЕ показан: приложение в трее недоступно (" + (res.error || "HTTP " + res.status) + ").")
+      [
+        `NEW_INSTRUCTION_FROM_OWNER ${hdr}`,
+        `status: new_instruction_received`,
+        `agent: ${slot.agentName}`,
+        "--- message ---",
+        claimedMsg.text,
+        "--- next_action ---",
+        tr(
+          `1. The PC owner sent you a new task/message from the ZeroIDE tray while you were on standby (${hdr}).`,
+          `1. Владелец ПК отправил тебе новое поручение/сообщение из трея ZeroIDE во время режима ожидания (${hdr}).`
+        ),
+        tr(
+          `2. Update task_status({ agent: "${slot.agentName}", status: "running", title: "...", current: "..." }) and execute the instruction immediately.`,
+          `2. Обнови task_status({ agent: "${slot.agentName}", status: "running", title: "...", current: "..." }) и сразу выполни поручение.`
+        ),
+        tr(
+          `3. When finished, mark task_status({ status: "done", ... }) and call await_owner again for another 5-minute standby window.`,
+          `3. Когда закончишь, отметь task_status({ status: "done", ... }) и снова вызови await_owner для 5-минутного ожидания.`
+        ),
+      ].join("\n")
     );
   }
+
+  if (slot.standbyReleased) {
+    slot.standbyUntilMs = 0;
+    slot.standbyPulseGraceUntilMs = 0;
+    slot.standbyReleased = false;
+    return textResult(
+      [
+        "STANDBY_RELEASED_BY_OWNER",
+        "status: released",
+        tr(
+          "message: The PC owner clicked Release in the tray. Standby is over — write your final response in chat and finish your turn now.",
+          "message: Владелец ПК нажал «Отпустить» в трее. Ожидание завершено — напиши финальный ответ в чате и завершай ход."
+        ),
+      ].join("\n")
+    );
+  }
+
+  const remainingSec = Math.max(0, Math.ceil((slot.standbyUntilMs - Date.now()) / 1000));
+  if (remainingSec <= 0) {
+    slot.standbyUntilMs = 0;
+    slot.standbyPulseGraceUntilMs = 0;
+    return textResult(
+      [
+        "STANDBY_TIMEOUT_COMPLETED",
+        "status: timeout_completed",
+        tr(
+          "message: The 5-minute standby window has elapsed with no new messages from the PC owner. You may now write your final response in chat and disconnect.",
+          "message: 5-минутное окно ожидания истекло, новых сообщений от владельца ПК не поступило. Теперь можешь написать финальный ответ в чате и завершить работу."
+        ),
+      ].join("\n")
+    );
+  }
+
+  // Allow up to 4 seconds for the client to send the next continueStandby pulse
+  // without flickering the tray indicator to offline.
+  slot.standbyPulseGraceUntilMs = Date.now() + 4000;
   return textResult(
-    title === ""
-      ? tr("Task status cleared.", "Статус задачи очищен.")
-      : tr("Task status shown in the tray.", "Статус задачи показан в трее.")
+    [
+      "STANDBY_KEEPALIVE",
+      "status: waiting_for_owner",
+      "remaining_seconds: " + remainingSec,
+      tr(
+        `next_action: Still holding the 5-minute standby connection (${remainingSec}s remaining). Immediately call await_owner({ agent: "${slot.agentName}", continueStandby: true }) with NO chat output in between to keep listening for the owner.`,
+        `next_action: Продолжаем удерживать 5-минутную связь (${remainingSec} с осталось). Немедленно вызови await_owner({ agent: "${slot.agentName}", continueStandby: true }) без лишнего текста, чтобы продолжить слушать трей.`
+      ),
+    ].join("\n")
+  );
+}
+
+async function handleAgentMessage(args, extra) {
+  const action = args.action || (args.text ? "send" : "list_agents");
+  const caller = extra?.caller || LEGACY_CALLER;
+  const slot = extra?.agentSlot || resolveAgentSlot({ caller }, args.from || args.agent);
+  if (action === "list_agents") {
+    const list = Array.from(agentRegistry.values()).map((a) => ({
+      agentId: a.agentId,
+      agentName: a.agentName,
+      token: a.tokenLabel,
+      taskTitle: a.title || "(no active task)",
+      currentStep: a.current || "-",
+      lastTool: a.lastTool || "-",
+      lastSeenAt: a.lastSeenAt,
+    }));
+    if (!list.length) return textResult(tr("No active agents registered yet.", "Активных агентов пока нет."));
+    return textResult(
+      [
+        "active_agents: " + list.length,
+        ...list.map(
+          (a) =>
+            `- agentId="${a.agentId}" name="${a.agentName}" token="${a.token}" task="${a.taskTitle}" step="${a.currentStep}" lastTool=${a.lastTool} lastSeen=${a.lastSeenAt}`
+        ),
+      ].join("\n")
+    );
+  }
+  const text = String(args.text || "").trim().slice(0, 2000);
+  if (!text) return textResult("ERROR: text is required when sending an agent_message.", true);
+  const to = String(args.to || "*").trim() || "*";
+  const stopCommand = Boolean(args.stopCommand);
+  const msg = enqueueOwnerMessage({
+    to,
+    text,
+    stopCommand,
+    from: args.from || slot.agentName || caller.label || "peer-agent",
+  });
+  return textResult(
+    [
+      tr("OK: message queued for instant delivery to agent.", "OK: сообщение поставлено в очередь мгновенной доставки агенту."),
+      "message_id: " + msg.id,
+      "to: " + msg.to,
+      "stop_running_command: " + msg.stopCommand,
+      tr(
+        "delivery: If the target agent is currently running a command, it will be interrupted immediately with a job_id; otherwise its next tool call will pause at the gate with your message.",
+        "delivery: Если целевой агент сейчас выполняет команду, она мгновенно переведётся в job_id с доставкой сообщения; иначе его следующий вызов получит сообщение на входном шлюзе."
+      ),
+    ].join("\n")
   );
 }
 
@@ -1530,14 +2830,24 @@ async function handleTakeScreenshot(args, extra) {
 
 // Sent once in the initialize response: the rules that apply to every tool.
 // Tool descriptions stay specific; cross-cutting guidance lives here so it is
-// not repeated fourteen times.
+// not repeated in every tool.
 const SERVER_INSTRUCTIONS = [
-  "ZeroIDE MCP: hands on the owner's Windows PC, supervised from a tray app. The owner sees every call and may approve, refuse or ignore it.",
+  "ZeroIDE MCP: hands on the owner's Windows PC, supervised from a tray app. The owner sees every call and may approve, refuse, pause or message you directly from the tray.",
   "- Pass a one-line `note` (in the owner's language) with every mutating call: it is shown on the approval card. A call with no note is harder to approve.",
+  "- Pass a consistent short `agent` name (e.g. your role or task name like \"Лендинг\", \"Backend\", \"Claude\") across your calls so the tray distinguishes you from other parallel agents.",
+  "- MANDATORY TASK TRACKING (`task_status`): Within your first 2 tool calls on any task, you MUST call `task_status({ agent, status: \"running\", title, current, done, next })` so the PC owner sees what you are working on in the tray. Update `task_status` every 3–5 calls as steps move from `next` to `current` and `done`. When your task is finished, call `task_status({ agent, status: \"done\", title, current: \"Готово: ...\", done, next: [] })` so the tray card turns green and stops the running animation.",
+  "- STANDBY MODE (`await_owner`): Do NOT stall normal chats with a 5-minute wait unless EITHER (a) the owner asks you to wait in the tray, OR (b) `task_status` / `journal_entry` returns `[HOLD_AFTER_TASK_ENABLED_BY_OWNER]` (meaning the owner explicitly flipped the 'Hold 5 min' switch in the tray because they are controlling you from the tray/another PC). When `[HOLD_AFTER_TASK_ENABLED_BY_OWNER]` is returned, you MUST send your report via `user_message` and immediately call `await_owner({ agent, summary: \"...\", waitMinutes: 5 })` instead of ending your turn in chat.",
+  "- PROACTIVE OWNER MESSAGES (`user_message`): The PC owner watches the tray window (often without looking at the chat). Proactively call `user_message({ agent, text, kind })` without waiting to be asked whenever: (1) you start a major stage (`kind: \"status\"`), (2) you finish a milestone or the task (`kind: \"status\"`), (3) you hit a warning or need the owner's attention (`kind: \"warning\"` or `\"request\"`).",
+  `- LIVE OWNER MESSAGES FROM TRAY ([ZEROIDE-OWNER-AUTH: ${OWNER_AUTH_TAG}]): The PC owner (or a peer agent via \`agent_message\`) can message you live while you work. If a running \`run_command\` returns \`INTERRUPTED_BY_OWNER\` with a \`job_id\`, the command is still running in the background under that \`job_id\` while you read the owner's message. If a call returns \`PAUSED_BY_OWNER\`, the call was paused BEFORE execution so you could read the message first — follow the owner's instruction, acknowledge via \`user_message\`, update \`task_status\`, and if the paused call does not conflict with the message, simply call it again.`,
   "- A DENIED result is the owner's decision: do not repeat the same call; explain and ask what to do instead.",
   "- run_command: anything that may take longer than ~20 s goes with wait=<seconds>; then poll job_status (wait up to 50 s) and job_output. Output is capped at 30 KB; a truncated result carries a job_id, and job_output pages the full text.",
-  "- Files: read_file before edit_file; prefer edit_file (exact fragment) to rewriting a file with write_file. Relative paths resolve against the project dir shown in results.",
-  "- Keep the owner informed on multi-step work: task_status for progress, user_message for anything they must know or do, take_screenshot only with a stated reason.",
+  "- Files: read_file before edit_file; prefer edit_file (exact fragment) to rewriting a file with write_file. Several fragments of one file go in ONE edit_file call via edits[] (all-or-nothing). Relative paths resolve against the project dir shown in results.",
+  "- Copy / move / delete / mkdir: use file_ops instead of shell commands. Deleted and overwritten files go to the owner's undo history (the result carries change_id), so the owner can restore them from the tray. Shell deletes (Remove-Item -Recurse, rd /s, del /s) are flagged as high risk and usually wait for approval.",
+  "- Starting on an unfamiliar PC: call system_info once (OS, shells, installed dev tools, project dir, what the owner pre-approved) instead of probing with several commands.",
+  "- Images (screenshots of a design, photos of an error, generated charts): read_image returns them to you as an image; large ones are downscaled.",
+  "- ZeroIDE protects itself: its config.env, tokens, OAuth and tray state files are not readable or writable by agents, and the tray control channel is off-limits. Do not try to work around it; ask the owner instead.",
+  "- Risk: commands and file operations are scored (low/medium/high/critical). High-risk calls may wait for the owner even if the tool is normally allowed; critical ones (formatting disks, wiping system folders, disabling protection) always need a fresh click. Explain why in `note`.",
+  "- When a result is ready to look at (a built page, a report, a folder), pass `open` to user_message: the owner gets an 'Open' button in the tray instead of hunting for the path.",
 ].join("\n");
 
 const NOTE_PARAM_SCHEMA = z
@@ -1546,6 +2856,14 @@ const NOTE_PARAM_SCHEMA = z
   .optional()
   .describe(
     "Short human-readable explanation (1 line, in the user's language) of what you are about to do and why. Shown to the user on the approval card. Always provide when calling mutating tools."
+  );
+
+const AGENT_PARAM_SCHEMA = z
+  .string()
+  .max(64)
+  .optional()
+  .describe(
+    "Short consistent identifier or display name of this agent (e.g. 'Claude · Лендинг', 'Тесты', 'Мой агент'). Used to separate tasks and route tray messages when multiple agents work in parallel."
   );
 
 /* --------------------------------- server -------------------------------- */
@@ -1611,6 +2929,7 @@ function makeServer(ctx) {
       inputSchema: {
         ...(config.inputSchema || {}),
         note: NOTE_PARAM_SCHEMA,
+        agent: (config.inputSchema && config.inputSchema.agent) || AGENT_PARAM_SCHEMA,
       },
     };
     return server.registerTool(
@@ -1621,8 +2940,52 @@ function makeServer(ctx) {
           typeof rawArgs?.note === "string"
             ? redactSecrets(rawArgs.note).replace(/\s+/g, " ").trim().slice(0, 200)
             : "";
+        const explicitAgent =
+          typeof rawArgs?.agent === "string"
+            ? rawArgs.agent.replace(/\s+/g, " ").trim().slice(0, 64)
+            : "";
         const cleanArgs = { ...(rawArgs || {}) };
         delete cleanArgs.note;
+        if (name !== "task_status" && name !== "user_message" && name !== "agent_message" && name !== "await_owner") {
+          delete cleanArgs.agent;
+        }
+        const agentSlot = resolveAgentSlot(sessionRef, explicitAgent);
+        agentSlot.lastTool = name;
+
+        const appendTaskProtocolNudge = (resObj) => {
+          if (!resObj || resObj.isError || !Array.isArray(resObj.content)) return resObj;
+          if (name === "task_status" || name === "user_message" || name === "agent_message" || name === "await_owner" || name === "journal_entry") {
+            return resObj;
+          }
+          agentSlot.totalCalls += 1;
+          agentSlot.callsSinceTaskStatus += 1;
+          let nudgeText = "";
+          if (!agentSlot.hasEverSetTask && agentSlot.totalCalls >= 1) {
+            nudgeText = tr(
+              `\n\n⚠️ [TRAY PROTOCOL]: The PC owner tracks your work in the ZeroIDE tray (and Telegram alerts if enabled), which currently shows no task. On your next step call task_status({ agent: "${agentSlot.agentName}", status: "running", title: "...", current: "...", done: [...], next: [...] }) and report milestones/results via user_message({ agent: "${agentSlot.agentName}", text: "...", kind: "status" }).`,
+              `\n\n⚠️ [ПРОТОКОЛ ТРЕЯ]: Владелец следит за работой в трее ZeroIDE (и в Telegram-алертах, если включены), где сейчас не отображается твоя задача. На следующем шаге вызови task_status({ agent: "${agentSlot.agentName}", status: "running", title: "...", current: "...", done: [...], next: [...] }) и сообщай об этапах и итоге через user_message({ agent: "${agentSlot.agentName}", text: "...", kind: "status" }).`
+            );
+          } else if (agentSlot.hasEverSetTask && agentSlot.callsSinceTaskStatus >= 4) {
+            nudgeText = tr(
+              `\n\n⚠️ [TRAY PROTOCOL]: ${agentSlot.callsSinceTaskStatus} calls since your last task_status update. Update task_status({ agent: "${agentSlot.agentName}", title: "${agentSlot.title}", current: "...", done: [...], next: [...] }) now so the tray reflects your actual current step` + (!agentSlot.hasEverSentUserMessage ? ` and send a brief update via user_message.` : `.`),
+              `\n\n⚠️ [ПРОТОКОЛ ТРЕЯ]: Прошло ${agentSlot.callsSinceTaskStatus} вызовов без обновления статуса задачи. Обнови task_status({ agent: "${agentSlot.agentName}", title: "${agentSlot.title}", current: "...", done: [...], next: [...] }), чтобы карточка «Текущая задача» соответствовала реальности` + (!agentSlot.hasEverSentUserMessage ? ` и отправь короткий статус через user_message.` : `.`)
+            );
+          } else if (agentSlot.hasEverSetTask && !agentSlot.hasEverSentUserMessage && agentSlot.totalCalls >= 3 && agentSlot.totalCalls % 3 === 0) {
+            nudgeText = tr(
+              `\n\nℹ️ [TRAY PROTOCOL]: You have not sent a user_message yet. Send brief progress or your final summary via user_message({ agent: "${agentSlot.agentName}", text: "...", kind: "status" }) so the owner sees it in the tray / Telegram.`,
+              `\n\nℹ️ [ПРОТОКОЛ ТРЕЯ]: Ты ещё не отправлял сообщение владельцу через user_message. Сообщи короткий прогресс или итог через user_message({ agent: "${agentSlot.agentName}", text: "...", kind: "status" }), чтобы владелец увидел его в трее / Telegram.`
+            );
+          }
+          if (nudgeText) {
+            for (const item of resObj.content) {
+              if (item.type === "text") {
+                item.text += nudgeText;
+                break;
+              }
+            }
+          }
+          return resObj;
+        };
 
         const argsHash = computeArgsHash(cleanArgs);
         const perms = loadPermissions();
@@ -1721,24 +3084,83 @@ function makeServer(ctx) {
               );
             }
             cleanArgs.path = chk.resolved;
+            if (name === "file_ops" && typeof cleanArgs.to === "string" && cleanArgs.to) {
+              const chkTo = confineTargetPath(conf.root, cleanArgs.to);
+              if (!chkTo.ok) {
+                audit({ event: "confinement.path_deny", tool: name, session: sessionRef.sessionId, token: callerLabel, argsHash, ok: false, reason: "PATH_OUTSIDE_ROOT", root: conf.root });
+                return textResult(
+                  [
+                    tr("DENIED [PATH_OUTSIDE_ROOT]: the destination is outside the allowed folder ", "ОТКАЗ [PATH_OUTSIDE_ROOT]: путь назначения выходит за пределы разрешённой папки ") + conf.root + ".",
+                    "tool: " + name,
+                    tr("action: Do NOT look for workarounds; keep both paths inside the allowed folder.", "action: НЕ ищи обходных путей; оба пути должны быть внутри разрешённой папки."),
+                  ].join("\n"),
+                  true
+                );
+              }
+              cleanArgs.to = chkTo.resolved;
+            }
           }
         }
 
-        // ---- user_message / take_screenshot / task_status: custom flows, bypass the generic gate ----
+        // ---- v0.5 self-protection: ZeroIDE's own credentials and state ----
+        if (FILE_TOOLS.has(name) && name !== "list_directory") {
+          const checks = [];
+          if (typeof cleanArgs.path === "string" && cleanArgs.path) {
+            const intent = name === "file_ops" ? (cleanArgs.op === "copy" ? "read" : "write") : WRITE_PATH_TOOLS.has(name) ? "write" : "read";
+            checks.push([resolvePath(cleanArgs.path), intent]);
+          }
+          if (name === "file_ops" && typeof cleanArgs.to === "string" && cleanArgs.to) checks.push([resolvePath(cleanArgs.to), "write"]);
+          for (const [target, intent] of checks) {
+            const kind = selfProtection(target, intent);
+            if (kind) {
+              audit({ event: "self.protect", tool: name, session: sessionRef.sessionId, token: callerLabel, argsHash, ok: false, reason: "PROTECTED_PATH", kind });
+              return protectedPathResult(name, target, kind);
+            }
+          }
+        }
+
+        // ---- user_message / take_screenshot / task_status / agent_message: custom flows, bypass the generic gate ----
         // user_message and task_status are display-only (no approval); take_screenshot captures first
         // so the approval card can preview exactly the image that would be sent.
         // The registered handlers below receive the agent note via extra.note, plus the resolved mode.
-        if (name === "user_message" || name === "take_screenshot" || name === "task_status") {
+        if (name === "user_message" || name === "take_screenshot" || name === "task_status" || name === "agent_message" || name === "await_owner") {
           const feedStart = Date.now();
-          const bypassRes = await handler(cleanArgs, { ...extra, note, caller, sessionId: sessionRef.sessionId, argsHash, mode });
-          const feedArgs = name === "task_status" ? { summary: String(cleanArgs.title || "") } : name === "user_message" ? { summary: String(cleanArgs.text || "") } : { summary: "screenshot" };
+          const bypassRes = await handler(cleanArgs, { ...extra, note, caller, sessionId: sessionRef.sessionId, argsHash, mode, agentSlot, confinement: conf });
+          const feedArgs = name === "task_status" ? { summary: String(cleanArgs.title || "") } : name === "user_message" ? { summary: String(cleanArgs.text || "") } : name === "await_owner" ? { summary: String(cleanArgs.summary || "standby 5m") } : name === "agent_message" ? { summary: String(cleanArgs.text || cleanArgs.action || "") } : { summary: "screenshot" };
           const feedEv = recordToolEvent(name, feedArgs, note, bypassRes && bypassRes.isError ? "failed" : "done");
           feedEv.durationMs = Date.now() - feedStart;
           return bypassRes;
         }
 
+        // ---- Pre-Execution Owner Message Gate (0% Prompt Injection Risk, Instant Delivery) ----
+        // If the PC owner (or a peer agent) queued a message for this agent while it was thinking,
+        // pause the incoming tool call BEFORE executing it or reading any external file.
+        if (name !== "job_status") {
+          const preMsg = matchAndClaimMessage(agentSlot, "paused_before_call");
+          if (preMsg) {
+            const pauseEv = recordToolEvent(name, cleanArgs, note || "paused by owner message", "done");
+            pauseEv.durationMs = 1;
+            return formatPausedByOwnerResult(preMsg, name, agentSlot);
+          }
+        }
+
+        // ---- v0.5 risk assessment: explains the card and drives riskGate ----
+        const assessed = MUTATING_TOOLS.has(name) || name === "read_file" || name === "read_image" || name === "search_files";
+        const risk = assessed ? assessRisk(name, cleanArgs) : { level: "low", reasons: [] };
+        const gate = { ...DEFAULT_PERMISSIONS.riskGate, ...(perms.riskGate || {}) };
+        if (riskAtLeast(risk.level, "high")) {
+          audit({ event: "risk.flagged", tool: name, session: sessionRef.sessionId, token: callerLabel, argsHash, level: risk.level, codes: risk.reasons.map((r) => r.code) });
+        }
         // 1. Check active grants first
-        const grantHit = findActiveGrant(name, argsHash);
+        let grantHit = findActiveGrant(name, argsHash);
+        let riskEscalated = "";
+        const grantable = !(gate.enabled !== false && riskAtLeast(risk.level, gate.grantsNeverCover || "critical"));
+        if (grantHit && !grantable) {
+          // No grant (tool-wide or exact) covers a critical call: the owner sees this call first.
+          grantHit = null;
+          riskEscalated = "grant";
+          if (mode === "allow") mode = "ask";
+        }
         let elevatedByRedFlag = false;
         if (!grantHit && name === "run_command" && mode === "allow") {
           if (
@@ -1748,6 +3170,13 @@ function makeServer(ctx) {
           ) {
             mode = "ask";
             elevatedByRedFlag = true;
+          }
+        }
+        if (!grantHit && mode === "allow" && gate.enabled !== false) {
+          const askAt = READ_TOOLS.has(name) ? (gate.sensitiveReads === false ? "" : "high") : gate.askAtOrAbove || "high";
+          if (askAt && riskAtLeast(risk.level, askAt)) {
+            mode = "ask";
+            riskEscalated = riskEscalated || "rule";
           }
         }
 
@@ -1784,9 +3213,21 @@ function makeServer(ctx) {
             true
           );
         } else if (mode === "ask") {
+          // An edit that cannot apply is answered right away instead of asking the owner first.
+          if (name === "edit_file") {
+            try {
+              const pre = prepareEdit(resolvePath(cleanArgs.path), cleanArgs);
+              if (!pre.ok) return editFailureResult(resolvePath(cleanArgs.path), pre, Array.isArray(cleanArgs.edits) ? cleanArgs.edits.length : 1);
+            } catch {}
+          }
+          if (name === "file_ops") {
+            const why = fileOpsPrecheck(cleanArgs);
+            if (why) return textResult(why, true);
+          }
           const timeoutSec = Math.max(5, Number(perms.approvalTimeoutSec) || 60);
           const reqId = "apr_" + crypto.randomUUID().slice(0, 8);
           const summary = buildApprovalSummary(name, cleanArgs);
+          const preview = name === "write_file" || name === "edit_file" ? buildChangePreview(name, cleanArgs) : null;
           audit({
             event: "approval.request",
             id: reqId,
@@ -1795,6 +3236,8 @@ function makeServer(ctx) {
             note,
             argsHash,
             elevatedByRedFlag: elevatedByRedFlag || undefined,
+            risk: risk.level !== "low" ? risk.level : undefined,
+            riskEscalated: riskEscalated || undefined,
             timeoutSec,
             target: summary.target,
             detail: summary.detail,
@@ -1809,6 +3252,15 @@ function makeServer(ctx) {
               argsHash,
               timeoutSec,
               createdAt: new Date().toISOString(),
+              agent: agentSlot.agentName || undefined,
+              assessment: {
+                level: risk.level,
+                headline: riskHeadline(risk.level),
+                reasons: risk.reasons.map((r) => r.text),
+                escalated: riskEscalated || (elevatedByRedFlag ? "redflag" : undefined),
+                grantable,
+              },
+              preview: preview || undefined,
             },
             timeoutSec
           );
@@ -1836,6 +3288,11 @@ function makeServer(ctx) {
             );
           }
 
+          if (decisionResp.decision === "allow_grant" && !grantable) {
+            // Critical calls are approved one at a time, even if an older tray offers a grant.
+            decisionResp.decision = "allow_once";
+            audit({ event: "risk.grant_refused", id: reqId, tool: name, session: sessionRef.sessionId, argsHash, level: risk.level, ok: true });
+          }
           if (decisionResp.decision === "allow_once") {
             audit({
               event: "approval.allow_once",
@@ -1910,13 +3367,14 @@ function makeServer(ctx) {
 
         if (caller.entry) bumpTokenUsage(caller.entry);
         const ev = recordToolEvent(name, cleanArgs, note, "running");
+        if (risk.level !== "low") ev.risk = risk.level;
         const t0 = Date.now();
         activeToolCalls += 1;
         try {
-          const res = await handler(cleanArgs, extra);
+          const res = await handler(cleanArgs, { ...extra, agentSlot, note, caller, confinement: conf, risk, sessionId: sessionRef.sessionId });
           ev.durationMs = Date.now() - t0;
           ev.status = res && res.isError ? "error" : "done";
-          return res;
+          return appendTaskProtocolNudge(res);
         } catch (err) {
           ev.durationMs = Date.now() - t0;
           ev.status = "error";
@@ -1936,12 +3394,14 @@ function makeServer(ctx) {
     {
       title: "Agent message",
       description:
-        "Show a short message to the PC owner in the tray (banner in the panel + icon tooltip; kind=request also pops a toast). Display-only: nothing leaves the PC and nothing is executed. The agent updates it as steps progress; an empty text clears it. Rate-limited to one per second.",
+        "Show a short message to the PC owner in the tray (banner in the panel + icon tooltip; kind=request also pops a toast). PROACTIVELY call this to report key milestones, completion summaries, or questions/blockers — the PC owner watches the tray window directly. Display-only: nothing leaves the PC and nothing is executed. Pass `open` to hand over a result: the banner gets an Open button for that page, file or folder. Pass `agent` to identify yourself when multiple agents work in parallel. An empty text clears it.",
       inputSchema: {
         text: z.string(),
         kind: z.enum(["status", "request", "warning"]).optional(),
         persistent: z.boolean().optional(),
         id: z.string().optional(),
+        open: z.string().max(2048).optional().describe("Optional http(s) URL or local path (file or folder) the owner can open with one click from the message, e.g. a built page, a report or an output folder. Nothing opens automatically; programs and scripts are only shown in Explorer."),
+        agent: AGENT_PARAM_SCHEMA,
       },
       annotations: {
         readOnlyHint: true,
@@ -1959,9 +3419,10 @@ function makeServer(ctx) {
     {
       title: "Task status",
       description:
-        "Show the agent's current task in the tray (panel block + icon tooltip): title, current step, completed steps and next steps, with an optional elapsed timer from startedAt. Display-only: nothing leaves the PC and nothing is executed. An empty title clears it. Last writer wins; the panel shows who updated it last. Rate-limited to one per second.",
+        "MANDATORY on all multi-step tasks: register and update your current task in the tray (panel block + multi-agent tab + icon tooltip). Call within your first 2 tool calls with `status: 'running'`, update every 3–5 calls so `current`, `done` and `next` always match reality, and when the task is complete MUST call with `status: 'done'` so the tray marks the task as completed (green check, stops progress animation) instead of leaving it looking like it is still running.",
       inputSchema: {
         title: z.string(),
+        status: z.enum(["running", "done", "waiting"]).optional().describe("Task state: 'running' while in progress, 'done' when completed (turns card green & stops spinner), 'waiting' when waiting on owner."),
         current: z.string().optional(),
         done: z.array(z.string()).optional(),
         next: z.array(z.string()).optional(),
@@ -1976,6 +3437,53 @@ function makeServer(ctx) {
       },
     },
     async (args, extra) => handleTaskStatus(args, extra)
+  );
+
+  /* ------------------------------ await_owner ---------------------------- */
+  reg(
+    "await_owner",
+    {
+      title: "Standby for owner (5 min)",
+      description:
+        "Call at the end of a completed task (right after `task_status({ status: 'done' })`) to hold the MCP connection open for 5 minutes (default `waitMinutes: 5`) so the PC owner can send you follow-up instructions from the ZeroIDE tray even if they do not have access to the chat window. Uses 45-second keepalive pulses under the hood so cloud proxies never time out. If it returns `STANDBY_KEEPALIVE`, immediately call `await_owner({ agent, continueStandby: true })` until either the owner sends a message (`NEW_INSTRUCTION_FROM_OWNER`) or the 5 minutes expire (`STANDBY_TIMEOUT_COMPLETED` / `STANDBY_RELEASED_BY_OWNER`).",
+      inputSchema: {
+        summary: z.string().optional().describe("Short completion message shown to the owner in the tray chat card while waiting."),
+        waitMinutes: z.number().optional().describe("Total standby duration in minutes (default 5)."),
+        continueStandby: z.boolean().optional().describe("Set true on subsequent keepalive pulses within the same 5-minute standby window."),
+        agent: AGENT_PARAM_SCHEMA,
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: true,
+        openWorldHint: false,
+      },
+    },
+    async (args, extra) => handleAwaitOwner(args, extra)
+  );
+
+  /* ------------------------------ agent_message ---------------------------- */
+  reg(
+    "agent_message",
+    {
+      title: "Agent messenger",
+      description:
+        "Send a live message/instruction to another working agent connected to this ZeroIDE MCP server (for example, when coordinating from another PC or another session), or list currently active agents and their tasks (`action: 'list_agents'`). When `action: 'send'` is used, if the target agent is currently executing `run_command`, its command is immediately backgrounded into a `job_id` (or stopped if `stopCommand: true`) and your message is delivered in <50ms; otherwise the target agent's very next tool call pauses at the gate with your message.",
+      inputSchema: {
+        action: z.enum(["send", "list_agents"]).optional(),
+        to: z.string().optional().describe("Target agent name/id (from list_agents) or '*' for all active agents."),
+        text: z.string().optional().describe("Message or instruction to deliver to the target agent."),
+        stopCommand: z.boolean().optional().describe("If true and the target agent is currently running a command, terminate that command immediately instead of moving it to a background job_id."),
+        from: z.string().optional().describe("Your agent name/identifier."),
+      },
+      annotations: {
+        readOnlyHint: true,
+        destructiveHint: false,
+        idempotentHint: false,
+        openWorldHint: false,
+      },
+    },
+    async (args, extra) => handleAgentMessage(args, extra)
   );
 
   /* ------------------------------ take_screenshot ---------------------------- */
@@ -2029,8 +3537,9 @@ function makeServer(ctx) {
         openWorldHint: true,
       },
     },
-    async ({ command, cwd, timeoutMs, maxOutputBytes, wait, requestId }) => {
+    async ({ command, cwd, timeoutMs, maxOutputBytes, wait, requestId }, extra) => {
       const maxOut = maxOutputBytes || DEFAULT_MAX_OUTPUT;
+      const slot = extra?.agentSlot || resolveAgentSlot(sessionRef);
       try {
         const hit = dedupeGet(requestId);
         if (hit) {
@@ -2074,39 +3583,78 @@ function makeServer(ctx) {
           });
         });
 
-        if (typeof wait === "number" && wait >= 0) {
-          const marker = Symbol("timeout");
-          const raced = await Promise.race([
-            started.promise,
-            new Promise((r) => setTimeout(() => r(marker), wait * 1000)),
-          ]);
-          if (raced === marker) {
-            const jobId = crypto.randomUUID().slice(0, 8);
+        const msgWaiter = createAgentMessageWaiter(slot, "interrupted_command");
+        const msgRacePromise = msgWaiter.promise.then((m) => ({ __ownerMsg: m }));
+        try {
+          if (typeof wait === "number" && wait >= 0) {
+            const marker = Symbol("timeout");
+            const raced = await Promise.race([
+              started.promise,
+              msgRacePromise,
+              new Promise((r) => setTimeout(() => r(marker), wait * 1000)),
+            ]);
+            if (raced && raced.__ownerMsg) {
+              const msg = raced.__ownerMsg;
+              if (msg.stopCommand) {
+                killTree(started.child);
+                return formatInterruptedCommandResult(msg, null, command, true, slot);
+              }
+              const jobId = keepAsJob(started.state);
+              jobs.set(jobId, {
+                id: jobId,
+                state: started.state,
+                promise: started.promise,
+                createdAt: Date.now(),
+              });
+              msg.jobId = jobId;
+              return formatInterruptedCommandResult(msg, jobId, command, false, slot);
+            }
+            if (raced === marker) {
+              const jobId = crypto.randomUUID().slice(0, 8);
+              jobs.set(jobId, {
+                id: jobId,
+                state: started.state,
+                promise: started.promise,
+                createdAt: Date.now(),
+              });
+              const text =
+                "status: running\njob_id: " +
+                jobId +
+                tr("\nmessage: the command is running in the background, the connection has been released.\n", "\nmessage: команда выполняется в фоне, соединение освобождено.\n") +
+                "next: job_status({ jobId: \"" +
+                jobId +
+                tr("\" }) to check the status, job_output({ jobId }) to fetch the output.\n", "\" }) чтобы проверить статус, job_output({ jobId }) чтобы забрать вывод.\n") +
+                "command: " +
+                command;
+              dedupeSet(requestId, Promise.resolve({ __job: true, text }));
+              return textResult(text);
+            }
+            dedupeSet(requestId, Promise.resolve(raced));
+            return textResult(formatRun(raced, maxOut));
+          }
+
+          dedupeSet(requestId, started.promise);
+          const raced = await Promise.race([started.promise, msgRacePromise]);
+          if (raced && raced.__ownerMsg) {
+            const msg = raced.__ownerMsg;
+            if (msg.stopCommand) {
+              killTree(started.child);
+              return formatInterruptedCommandResult(msg, null, command, true, slot);
+            }
+            const jobId = keepAsJob(started.state);
             jobs.set(jobId, {
               id: jobId,
               state: started.state,
               promise: started.promise,
               createdAt: Date.now(),
             });
-            const text =
-              "status: running\njob_id: " +
-              jobId +
-              tr("\nmessage: the command is running in the background, the connection has been released.\n", "\nmessage: команда выполняется в фоне, соединение освобождено.\n") +
-              "next: job_status({ jobId: \"" +
-              jobId +
-              tr("\" }) to check the status, job_output({ jobId }) to fetch the output.\n", "\" }) чтобы проверить статус, job_output({ jobId }) чтобы забрать вывод.\n") +
-              "command: " +
-              command;
-            dedupeSet(requestId, Promise.resolve({ __job: true, text }));
-            return textResult(text);
+            msg.jobId = jobId;
+            return formatInterruptedCommandResult(msg, jobId, command, false, slot);
           }
-          dedupeSet(requestId, Promise.resolve(raced));
           return textResult(formatRun(raced, maxOut));
+        } finally {
+          msgWaiter.cleanup();
         }
-
-        dedupeSet(requestId, started.promise);
-        const st = await started.promise;
-        return textResult(formatRun(st, maxOut));
       } catch (e) {
         audit({
           tool: "run_command",
@@ -2145,7 +3693,8 @@ function makeServer(ctx) {
         openWorldHint: false,
       },
     },
-    async ({ jobId, waitSec, tailLines }) => {
+    async ({ jobId, waitSec, tailLines }, extra) => {
+      const slot = extra?.agentSlot || resolveAgentSlot(sessionRef);
       const job = jobs.get(jobId);
       if (!job)
         return textResult(
@@ -2157,8 +3706,10 @@ function makeServer(ctx) {
       const waitMs =
         Math.min(Math.max(Number(waitSec) || 0, 0), MAX_JOB_WAIT_SEC) * 1000;
       const deadline = waitedFrom + waitMs;
-      while (job.state.status === "running" && Date.now() < deadline) {
-        await new Promise((r) => setTimeout(r, 250));
+      let interruptedMsg = matchAndClaimMessage(slot, "interrupted_job_wait");
+      while (!interruptedMsg && job.state.status === "running" && Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, 100));
+        interruptedMsg = matchAndClaimMessage(slot, "interrupted_job_wait");
       }
       const s = job.state;
       const nTail = Math.min(Math.max(Number(tailLines) || 0, 0), 200);
@@ -2170,7 +3721,15 @@ function makeServer(ctx) {
         if (out.length > 8192) out = "..." + out.slice(-8192);
         return out;
       };
-      const lines = [
+      const lines = [];
+      if (interruptedMsg) {
+        const hdr = formatSenderHeader(interruptedMsg);
+        lines.push(`INTERRUPTED_BY_OWNER ${hdr}`);
+        lines.push("--- message ---");
+        lines.push(interruptedMsg.text);
+        lines.push("--- job_status_snapshot ---");
+      }
+      lines.push(
         "job_id: " + jobId,
         "status: " + s.status,
         "exit_code: " + (s.exitCode === null ? tr("(still running)", "(ещё выполняется)") : s.exitCode),
@@ -2180,8 +3739,8 @@ function makeServer(ctx) {
         "stdout_bytes: " + s.stdoutBytes,
         "stderr_bytes: " + s.stderrBytes,
         "cwd: " + s.cwd,
-        "command: " + s.command,
-      ];
+        "command: " + s.command
+      );
       if (nTail > 0) {
         lines.push("--- stdout tail (" + nTail + tr(" lines) ---", " строк) ---"));
         lines.push(tailOf(s.stdout));
@@ -2552,7 +4111,7 @@ function makeServer(ctx) {
       description:
         "Write a UTF-8 text file on this computer ATOMICALLY (temp file + rename, so a dropped connection never leaves a half-written file). Creates or overwrites the file. " +
         "Pass expectedSha256 (from read_file) to refuse the write if the file changed meanwhile — this prevents silently overwriting " +
-        "work done by another agent in parallel. A timestamped .bak copy is kept by default. Use dryRun=true to preview a diff without writing.",
+        "work done by another agent in parallel. The previous version is kept in ZeroIDE history (not next to the file), so the owner can undo the change in Settings → Changes; backup=false skips that. Use dryRun=true to preview a diff without writing.",
       inputSchema: {
         path: z.string(),
         content: z.string(),
@@ -2577,7 +4136,7 @@ function makeServer(ctx) {
       dryRun,
       backup,
       requestId,
-    }) => {
+    }, extra) => {
       try {
         const fullPath = resolvePath(filePath);
         const exists = fs.existsSync(fullPath);
@@ -2633,12 +4192,8 @@ function makeServer(ctx) {
         const work = (async () => {
           const dir = path.dirname(fullPath);
           fs.mkdirSync(dir, { recursive: true });
-          let backupPath = null;
-          if (exists && backup !== false) {
-            backupPath =
-              fullPath + ".bak." + new Date().toISOString().replace(/[:.]/g, "").slice(0, 15);
-            fs.copyFileSync(fullPath, backupPath);
-          }
+          const bytesBefore = exists ? fs.statSync(fullPath).size : 0;
+          const kept = keepBeforeChange(fullPath, backup);
           const tmp = path.join(
             dir,
             "." + path.basename(fullPath) + ".tmp-" + crypto.randomUUID().slice(0, 8)
@@ -2646,22 +4201,43 @@ function makeServer(ctx) {
           fs.writeFileSync(tmp, content, "utf8");
           fs.renameSync(tmp, fullPath);
           const newSha = fileSha(fullPath);
+          const bytes = Buffer.byteLength(content, "utf8");
+          historyAppend({
+            id: kept.id,
+            op: exists ? "modify" : "create",
+            tool: "write_file",
+            path: fullPath,
+            kind: "file",
+            backup: kept.backup,
+            beforeSha: currentSha,
+            afterSha: newSha,
+            bytesBefore,
+            bytesAfter: bytes,
+            session: sessionRef.sessionId,
+            agent: extra?.agentSlot?.agentName || "",
+            note: extra?.note || "",
+            risk: extra?.risk && extra.risk.level !== "low" ? extra.risk.level : undefined,
+          });
           audit({
             tool: "write_file",
             session: sessionRef.sessionId,
             requestId: requestId || null,
             path: fullPath,
-            bytes: Buffer.byteLength(content, "utf8"),
-            backup: backupPath,
+            bytes,
+            backup: kept.backup || kept.sidecar,
+            change: kept.id,
             newSha,
             ok: true,
           });
           return [
             tr("OK: file written atomically (tmp + rename).", "OK: файл записан атомарно (tmp + rename)."),
             "path: " + fullPath,
-            "bytes: " + Buffer.byteLength(content, "utf8"),
+            "bytes: " + bytes,
             "new_sha256: " + newSha,
-            backupPath ? "backup: " + backupPath : tr("backup: (not created)", "backup: (не создавался)"),
+            kept.backup || kept.sidecar
+              ? "backup: " + (kept.backup || kept.sidecar)
+              : exists ? tr("backup: (not created)", "backup: (не создавался)") : tr("backup: (new file)", "backup: (новый файл)"),
+            "change_id: " + kept.id + tr("  (the owner can undo it in Settings → Changes)", "  (владелец может откатить в Настройки → «Изменения»)"),
           ].join("\n");
         })();
 
@@ -2686,13 +4262,20 @@ function makeServer(ctx) {
     {
       title: "Edit file",
       description:
-        "Replace an exact text fragment in a file instead of rewriting the whole file. " +
-        "Refuses the edit if oldString is not found or found more than once, so it can never patch the wrong place. " +
-        "Supports expectedSha256 (safe concurrent editing), dryRun preview and automatic .bak backup. Write is atomic.",
+        "Replace exact text fragments in a file instead of rewriting the whole file. " +
+        "One edit: oldString/newString. Several edits in one atomic change: edits=[{oldString,newString,replaceAll?}] — applied in order, all or nothing. " +
+        "Refuses an edit whose oldString is not found or found more than once (unless replaceAll), so it can never patch the wrong place. " +
+        "Supports expectedSha256 (safe concurrent editing) and dryRun preview; the previous version is kept in ZeroIDE history for undo. Write is atomic.",
       inputSchema: {
         path: z.string(),
-        oldString: z.string(),
-        newString: z.string(),
+        oldString: z.string().optional(),
+        newString: z.string().optional(),
+        replaceAll: z.boolean().optional().describe("Single-edit mode: replace every occurrence of oldString instead of requiring exactly one."),
+        edits: z
+          .array(z.object({ oldString: z.string(), newString: z.string(), replaceAll: z.boolean().optional() }))
+          .max(100)
+          .optional()
+          .describe("Several replacements applied in order as one atomic change. Use instead of oldString/newString."),
         expectedSha256: z.string().optional(),
         dryRun: z.boolean().optional(),
         backup: z.boolean().optional(),
@@ -2711,11 +4294,13 @@ function makeServer(ctx) {
       path: filePath,
       oldString,
       newString,
+      replaceAll,
+      edits,
       expectedSha256,
       dryRun,
       backup,
       requestId,
-    }) => {
+    }, extra) => {
       try {
         const fullPath = resolvePath(filePath);
         if (!fs.existsSync(fullPath))
@@ -2754,37 +4339,18 @@ function makeServer(ctx) {
           );
         }
 
-        const parts = text.split(oldString);
-        const occurrences = parts.length - 1;
-        if (occurrences === 0)
-          return textResult(
-            [
-              tr("DENIED: oldString not found in the file — nothing changed.", "ОТКАЗ: oldString не найден в файле — ничего не изменено."),
-              "path: " + fullPath,
-              tr("hint: check spaces, indents and line breaks; the text must match character for character.", "hint: проверь пробелы, отступы и переносы строк; текст должен совпадать посимвольно."),
-            ].join("\n"),
-            true
-          );
-        if (occurrences > 1)
-          return textResult(
-            [
-              tr("DENIED: oldString occurs ", "ОТКАЗ: oldString встречается ") +
-                occurrences +
-                tr(" times — edit cancelled to avoid changing the wrong place.", " раз — правка отменена, чтобы не изменить не то место."),
-              "path: " + fullPath,
-              tr("hint: widen oldString so the fragment becomes unique.", "hint: расширь oldString так, чтобы фрагмент стал уникальным."),
-            ].join("\n"),
-            true
-          );
-
-        const updated = parts.join(newString);
+        const editArgs = { oldString, newString, replaceAll, edits };
+        const editCount = Array.isArray(edits) && edits.length ? edits.length : 1;
+        const prep = prepareEdit(fullPath, editArgs);
+        if (!prep.ok) return editFailureResult(fullPath, prep, editCount);
+        const updated = prep.updated;
 
         if (dryRun) {
           return textResult(
             [
               tr("DRY RUN — nothing written.", "DRY RUN — ничего не записано."),
               "path: " + fullPath,
-              tr("occurrences: 1 (ok)", "occurrences: 1 (ок)"),
+              tr("edits: ", "правок: ") + prep.edits + tr(", replacements: ", ", замен: ") + prep.replaced + tr(" (ok)", " (ок)"),
               "current_sha256: " + currentSha,
               "--- diff ---",
               clampText(makeUnifiedDiff(text, updated, fullPath), 60 * 1024).text,
@@ -2794,12 +4360,7 @@ function makeServer(ctx) {
 
         const work = (async () => {
           const dir = path.dirname(fullPath);
-          let backupPath = null;
-          if (backup !== false) {
-            backupPath =
-              fullPath + ".bak." + new Date().toISOString().replace(/[:.]/g, "").slice(0, 15);
-            fs.copyFileSync(fullPath, backupPath);
-          }
+          const kept = keepBeforeChange(fullPath, backup);
           const tmp = path.join(
             dir,
             "." + path.basename(fullPath) + ".tmp-" + crypto.randomUUID().slice(0, 8)
@@ -2807,21 +4368,43 @@ function makeServer(ctx) {
           fs.writeFileSync(tmp, updated, "utf8");
           fs.renameSync(tmp, fullPath);
           const newSha = fileSha(fullPath);
+          historyAppend({
+            id: kept.id,
+            op: "modify",
+            tool: "edit_file",
+            path: fullPath,
+            kind: "file",
+            backup: kept.backup,
+            beforeSha: currentSha,
+            afterSha: newSha,
+            bytesBefore: buf.length,
+            bytesAfter: Buffer.byteLength(updated, "utf8"),
+            edits: prep.edits,
+            session: sessionRef.sessionId,
+            agent: extra?.agentSlot?.agentName || "",
+            note: extra?.note || "",
+            risk: extra?.risk && extra.risk.level !== "low" ? extra.risk.level : undefined,
+          });
           audit({
             tool: "edit_file",
             session: sessionRef.sessionId,
             requestId: requestId || null,
             path: fullPath,
-            replacedBytes: Buffer.byteLength(oldString, "utf8"),
+            edits: prep.edits,
+            replacements: prep.replaced,
+            change: kept.id,
             newSha,
             ok: true,
           });
           return [
-            tr("OK: replaced 1 occurrence, file written atomically.", "OK: заменено 1 вхождение, файл записан атомарно."),
+            prep.edits > 1 || prep.replaced > 1
+              ? tr("OK: applied " + prep.edits + " edit(s), " + prep.replaced + " replacement(s), file written atomically.", "OK: применено правок: " + prep.edits + ", замен: " + prep.replaced + ", файл записан атомарно.")
+              : tr("OK: replaced 1 occurrence, file written atomically.", "OK: заменено 1 вхождение, файл записан атомарно."),
             "path: " + fullPath,
             "old_sha256: " + currentSha,
             "new_sha256: " + newSha,
-            backupPath ? "backup: " + backupPath : tr("backup: (not created)", "backup: (не создавался)"),
+            kept.backup || kept.sidecar ? "backup: " + (kept.backup || kept.sidecar) : tr("backup: (not created)", "backup: (не создавался)"),
+            "change_id: " + kept.id + tr("  (the owner can undo it in Settings → Changes)", "  (владелец может откатить в Настройки → «Изменения»)"),
           ].join("\n");
         })();
 
@@ -2835,6 +4418,250 @@ function makeServer(ctx) {
           ok: false,
           error: String((e && e.message) || e),
         });
+        return errResult(e);
+      }
+    }
+  );
+
+  /* ------------------------------- read_image ---------------------------- */
+  reg(
+    "read_image",
+    {
+      title: "View image",
+      description:
+        "Look at an image file on this PC (PNG, JPEG, GIF, BMP, ICO, WebP): returns the picture itself, so you can check screenshots, UI renders, charts or photos the owner points you to. " +
+        "Large images are downscaled on the PC (maxSize, default 1600 px on the longer side; the file itself is not changed). Same folder rules as read_file; the owner may require approval because the picture leaves the PC.",
+      inputSchema: {
+        path: z.string(),
+        maxSize: z.number().int().min(64).max(4096).optional().describe("Longest side in pixels after downscaling (default 1600)."),
+        format: z.enum(["auto", "png", "jpeg"]).optional().describe("auto keeps JPEG photos as JPEG and everything else as PNG."),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ path: filePath, maxSize, format }) => {
+      try {
+        const fullPath = resolvePath(filePath);
+        let st;
+        try { st = fs.statSync(fullPath); } catch { return textResult(tr("ERROR: file not found: ", "ERROR: файл не найден: ") + fullPath, true); }
+        if (!st.isFile()) return textResult(tr("ERROR: not a file: ", "ERROR: это не файл: ") + fullPath, true);
+        if (st.size > IMAGE_MAX_SOURCE_BYTES) return textResult(tr("ERROR: the image is larger than 64 MB.", "ERROR: изображение больше 64 МБ."), true);
+        const buf = fs.readFileSync(fullPath);
+        const info = sniffImage(buf);
+        if (!info) return textResult(tr("ERROR: not a supported image (PNG, JPEG, GIF, BMP, ICO, WebP): ", "ERROR: неподдерживаемый формат (нужен PNG, JPEG, GIF, BMP, ICO, WebP): ") + fullPath, true);
+        const max = Math.max(64, Math.min(4096, Number(maxSize) || 1600));
+        const fmt = format === "png" || format === "jpeg" ? format : "auto";
+        const fits = info.width > 0 && info.height > 0 && Math.max(info.width, info.height) <= max;
+        const sameFormat = fmt === "auto" || fmt === info.type;
+        let data, mime, outW = info.width, outH = info.height, converted = false;
+        if (["png", "jpeg", "gif", "webp"].includes(info.type) && buf.length <= IMAGE_PASSTHROUGH_BYTES && sameFormat && (fits || info.type === "webp")) {
+          data = buf.toString("base64");
+          mime = info.mime;
+        } else if (!IS_WIN) {
+          return textResult(tr("ERROR: downscaling needs Windows; ask for a smaller image.", "ERROR: уменьшение доступно только в Windows; попроси изображение поменьше."), true);
+        } else if (info.type === "webp") {
+          return textResult(tr("ERROR: this WebP image is too large to send (", "ERROR: это WebP-изображение слишком большое (") + fmtBytes(buf.length) + tr(") and WebP cannot be downscaled here. Convert it to PNG or JPEG first.", "), а WebP здесь не уменьшить. Сначала преобразуй его в PNG или JPEG."), true);
+        } else {
+          const target = fmt === "auto" ? (info.type === "jpeg" ? "jpeg" : "png") : fmt;
+          let r = await psConvertImage(fullPath, max, target);
+          if (r.ok && target === "png" && fmt === "auto" && r.base64.length > 4 * 1024 * 1024) r = await psConvertImage(fullPath, max, "jpeg");
+          if (!r.ok) return textResult(tr("ERROR: could not read the image: ", "ERROR: не удалось прочитать изображение: ") + r.error, true);
+          data = r.base64;
+          mime = r.mime;
+          outW = r.w;
+          outH = r.h;
+          converted = true;
+          if (!info.width) { info.width = r.srcW; info.height = r.srcH; }
+        }
+        audit({ tool: "read_image", session: sessionRef.sessionId, path: fullPath, bytes: buf.length, converted, ok: true });
+        const lines = [
+          "path: " + fullPath,
+          tr("format: ", "формат: ") + info.type + (converted ? " → " + (mime === "image/jpeg" ? "jpeg" : "png") : ""),
+          tr("size: ", "размер: ") + (info.width && info.height ? info.width + "×" + info.height : "?") + (converted && (outW !== info.width || outH !== info.height) ? " → " + outW + "×" + outH : "") + " px",
+          tr("file: ", "файл: ") + fmtBytes(buf.length) + ", sha256: " + sha256(buf).slice(0, 16) + "…",
+        ];
+        return { content: [{ type: "text", text: lines.join("\n") }, { type: "image", data, mimeType: mime }] };
+      } catch (e) {
+        audit({ tool: "read_image", session: sessionRef.sessionId, path: filePath, ok: false, error: String((e && e.message) || e) });
+        return errResult(e);
+      }
+    }
+  );
+
+  /* -------------------------------- file_ops ----------------------------- */
+  reg(
+    "file_ops",
+    {
+      title: "File operations",
+      description:
+        "Copy, move/rename or delete files and folders, or create a folder, without a shell. " +
+        "delete never destroys data: the files move to ZeroIDE history and the owner can restore them in Settings → Changes. " +
+        "Anything replaced with overwrite=true keeps its previous version too. Prefer this to Remove-Item/Move-Item in run_command: it is reversible and the owner sees exactly what changes.",
+      inputSchema: {
+        op: z.enum(["copy", "move", "delete", "mkdir"]),
+        path: z.string().describe("Source (copy/move/delete) or the folder to create (mkdir). Absolute or relative to the project dir."),
+        to: z.string().optional().describe("Destination for copy and move."),
+        overwrite: z.boolean().optional().describe("copy/move: replace an existing destination file; its previous version is kept in history. Default false."),
+        recursive: z.boolean().optional().describe("Required to copy or delete a folder with its contents."),
+      },
+      annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
+    },
+    async ({ op, path: srcRaw, to, overwrite, recursive }, extra) => {
+      const src = resolvePath(srcRaw);
+      const dst = to ? resolvePath(to) : "";
+      const meta = { session: sessionRef.sessionId, agent: extra?.agentSlot?.agentName || "", note: extra?.note || "" };
+      const fail = (code, message, hint) => {
+        audit({ tool: "file_ops", session: sessionRef.sessionId, op, path: src, to: dst || undefined, ok: false, reason: code });
+        return textResult([message, "op: " + op, "path: " + src, dst ? "to: " + dst : null, hint ? "hint: " + hint : null].filter(Boolean).join("\n"), true);
+      };
+      try {
+        if (op === "mkdir") {
+          const existed = fs.existsSync(src);
+          if (existed && !fs.statSync(src).isDirectory()) return fail("NOT_A_FOLDER", tr("ERROR: a file with this name already exists.", "ОШИБКА: файл с таким именем уже существует."));
+          fs.mkdirSync(src, { recursive: true });
+          if (!existed) historyAppend({ id: historyNewId(), op: "mkdir", tool: "file_ops", path: src, kind: "dir", ...meta });
+          audit({ tool: "file_ops", session: sessionRef.sessionId, op, path: src, existed, ok: true });
+          return textResult([existed ? tr("OK: the folder already exists.", "OK: папка уже существует.") : tr("OK: folder created.", "OK: папка создана."), "path: " + src].join("\n"));
+        }
+        if (!fs.existsSync(src)) return fail("NOT_FOUND", tr("ERROR: path not found.", "ОШИБКА: путь не найден."));
+        const st = fs.statSync(src);
+        const isDir = st.isDirectory();
+        if (op === "delete") {
+          const guard = deleteGuard(src);
+          if (guard) return fail("REFUSED", guard);
+          if (isDir && !recursive) return fail("FOLDER_NEEDS_RECURSIVE", tr("ERROR: this is a folder; pass recursive: true to delete it with its contents.", "ОШИБКА: это папка; передай recursive: true, чтобы удалить её вместе с содержимым."));
+          const stats = isDir ? measureTree(src, TRASH_MAX_FILES + 1) : { files: 1, bytes: st.size };
+          if (stats.files > TRASH_MAX_FILES || stats.bytes > TRASH_MAX_BYTES)
+            return fail("TOO_LARGE_FOR_HISTORY", tr("DENIED: too large to keep a recoverable copy (more than 20,000 files or 2 GB).", "ОТКАЗ: слишком большой объём для восстанавливаемой копии (больше 20 000 файлов или 2 ГБ)."), tr("delete smaller parts, or ask the owner to remove it by hand.", "удаляй частями или попроси владельца удалить это вручную."));
+          const id = historyNewId();
+          const keepDir = path.join(HISTORY_DIR, "trash", historyDay(), id);
+          fs.mkdirSync(keepDir, { recursive: true });
+          const keptAt = path.join(keepDir, path.basename(src));
+          const beforeSha = isDir ? null : fileSha(src);
+          movePath(src, keptAt);
+          historyAppend({ id, op: "delete", tool: "file_ops", path: src, kind: isDir ? "dir" : "file", backup: keptAt, beforeSha, files: stats.files, bytes: stats.bytes, risk: extra?.risk && extra.risk.level !== "low" ? extra.risk.level : undefined, ...meta });
+          audit({ tool: "file_ops", session: sessionRef.sessionId, op, path: src, files: stats.files, bytes: stats.bytes, change: id, ok: true });
+          return textResult(
+            [
+              tr("OK: deleted — moved to ZeroIDE history, recoverable.", "OK: удалено — перемещено в историю ZeroIDE, можно восстановить."),
+              "path: " + src,
+              tr("kind: ", "тип: ") + (isDir ? tr("folder", "папка") + ", " + stats.files + tr(" files", " файлов") : tr("file", "файл")) + ", " + fmtBytes(stats.bytes),
+              "change_id: " + id + tr("  (the owner restores it in Settings → Changes)", "  (владелец восстанавливает это в Настройки → «Изменения»)"),
+            ].join("\n")
+          );
+        }
+        if (op === "copy" || op === "move") {
+          if (!dst) return fail("NO_DESTINATION", tr("ERROR: pass `to` with the destination path.", "ОШИБКА: передай `to` — путь назначения."));
+          const cs = canonicalLoose(src), cd = canonicalLoose(dst);
+          if (cs === cd) return fail("SAME_PATH", tr("ERROR: source and destination are the same.", "ОШИБКА: источник и назначение совпадают."));
+          if (isDir && insideDir(cs, cd)) return fail("INTO_ITSELF", tr("ERROR: a folder cannot be copied or moved into itself.", "ОШИБКА: папку нельзя копировать или переносить внутрь самой себя."));
+          if (op === "copy" && isDir && !recursive) return fail("FOLDER_NEEDS_RECURSIVE", tr("ERROR: this is a folder; pass recursive: true to copy it with its contents.", "ОШИБКА: это папка; передай recursive: true, чтобы скопировать её вместе с содержимым."));
+          if (op === "move") { const guard = deleteGuard(src); if (guard) return fail("REFUSED", guard); }
+          const dstExists = fs.existsSync(dst);
+          let replacedChange = null;
+          if (dstExists) {
+            if (!overwrite) return fail("DESTINATION_EXISTS", tr("DENIED: the destination already exists — nothing changed.", "ОТКАЗ: назначение уже существует — ничего не изменено."), tr("pass overwrite: true to replace it (its previous version is kept in history).", "передай overwrite: true, чтобы заменить (прежняя версия сохранится в истории)."));
+            if (fs.statSync(dst).isDirectory() || isDir) return fail("FOLDER_OVERWRITE", tr("DENIED: replacing an existing folder is not supported. Delete it first (it goes to history) or choose another destination.", "ОТКАЗ: замена существующей папки не поддерживается. Сначала удали её (она попадёт в историю) или выбери другое место."));
+            const kept = keepBeforeChange(dst, true);
+            replacedChange = kept.id;
+            historyAppend({ id: kept.id, op: "overwrite", tool: "file_ops", path: dst, kind: "file", backup: kept.backup, beforeSha: fileSha(dst), reason: op, ...meta });
+          }
+          const stats = isDir ? measureTree(src, 200001) : { files: 1, bytes: st.size };
+          fs.mkdirSync(path.dirname(dst), { recursive: true });
+          if (op === "copy") fs.cpSync(src, dst, { recursive: isDir, force: true, errorOnExist: false, preserveTimestamps: true });
+          else {
+            if (dstExists) fs.rmSync(dst, { force: true });
+            movePath(src, dst);
+          }
+          const id = historyNewId();
+          historyAppend({ id, op, tool: "file_ops", path: src, to: dst, kind: isDir ? "dir" : "file", files: stats.files, bytes: stats.bytes, replaced: replacedChange, afterSha: isDir ? null : fileSha(dst), ...meta });
+          audit({ tool: "file_ops", session: sessionRef.sessionId, op, path: src, to: dst, files: stats.files, bytes: stats.bytes, overwrote: dstExists, change: id, ok: true });
+          return textResult(
+            [
+              op === "copy" ? tr("OK: copied.", "OK: скопировано.") : tr("OK: moved.", "OK: перемещено."),
+              "from: " + src,
+              "to: " + dst,
+              tr("kind: ", "тип: ") + (isDir ? tr("folder", "папка") + ", " + stats.files + tr(" files", " файлов") : tr("file", "файл")) + ", " + fmtBytes(stats.bytes),
+              replacedChange ? tr("replaced file kept as change ", "заменённый файл сохранён как изменение ") + replacedChange : null,
+              "change_id: " + id,
+            ].filter(Boolean).join("\n")
+          );
+        }
+        return fail("BAD_OP", tr("ERROR: unknown op.", "ОШИБКА: неизвестная операция."));
+      } catch (e) {
+        audit({ tool: "file_ops", session: sessionRef.sessionId, op, path: src, to: dst || undefined, ok: false, error: String((e && e.message) || e) });
+        return errResult(e);
+      }
+    }
+  );
+
+  /* ------------------------------ system_info ---------------------------- */
+  reg(
+    "system_info",
+    {
+      title: "System info",
+      description:
+        "One read-only call for the context you would otherwise gather with several commands: Windows version, CPU, memory, disks, displays, user, time zone, PowerShell and installed developer tools (node, npm, python, git, dotnet, java, go, rust, docker, winget). " +
+        "It also says how ZeroIDE is set up for you right now: project folder, folder confinement, your access scope, which tools run freely, ask the owner first or are disabled, active temporary grants and where undo history is kept. Call it once at the start of a task.",
+      inputSchema: {
+        refresh: z.boolean().optional().describe("Probe installed tools again instead of using the 10-minute cache."),
+      },
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async ({ refresh }, extra) => {
+      try {
+        if (refresh) systemInfoCache = null;
+        const f = await collectSystemFacts();
+        const perms = loadPermissions();
+        const caller = extra?.caller || LEGACY_CALLER;
+        const conf = extra?.confinement || {};
+        const confined = !!conf.root;
+        const modeOf = (t) => (perms.tools && perms.tools[t] && perms.tools[t].mode) || perms.defaultMode || "ask";
+        const groups = { allow: [], ask: [], deny: [] };
+        for (const t of ["read_file", "read_image", "list_directory", "search_files", "write_file", "edit_file", "file_ops", "run_command", "take_screenshot", "journal_entry"]) (groups[modeOf(t)] || groups.ask).push(t);
+        pruneGrants();
+        const grants = [...activeGrants.values()].map((g) => g.tool + (g.scope === "exact" ? tr(" (one exact call)", " (один конкретный вызов)") : "") + ", " + Math.max(1, Math.round((g.expiresAt - Date.now()) / 60000)) + tr(" min left", " мин осталось"));
+        const gate = { ...DEFAULT_PERMISSIONS.riskGate, ...(perms.riskGate || {}) };
+        const found = new Set(f.tools.map(([n]) => n));
+        const missing = (IS_WIN ? ["node", "npm", "python", "git", "dotnet", "java", "go", "rustc", "docker", "winget", "pwsh"] : ["node", "npm", "python3", "git", "dotnet", "docker"]).filter((n) => !found.has(n));
+        const out = ["== " + tr("Machine", "Компьютер") + " ==", "os: " + f.os + " · " + f.arch, "cpu: " + f.cpu, tr("memory: ", "память: ") + fmtBytes(f.memTotal) + tr(" total, ", " всего, ") + fmtBytes(f.memFree) + tr(" free", " свободно")];
+        if (!confined) {
+          out.push(tr("user: ", "пользователь: ") + f.user + " @ " + f.host);
+          for (const d of f.disks) out.push(tr("disk ", "диск ") + d.root + " " + fmtBytes(d.free) + tr(" free of ", " свободно из ") + fmtBytes(d.total));
+          if (f.displays.length) out.push(tr("displays: ", "мониторы: ") + f.displays.join(", "));
+        }
+        out.push(tr("time: ", "время: ") + new Date().toLocaleString("sv-SE") + " (" + f.timeZone + "), locale " + f.locale + tr(", uptime ", ", работает ") + Math.floor(f.uptimeSec / 3600) + tr(" h", " ч"));
+        out.push("", "== " + tr("Shell and tools", "Оболочка и инструменты") + " ==");
+        if (f.powershell) out.push("powershell: " + f.powershell + (IS_WIN ? tr(" (run_command runs Windows PowerShell)", " (run_command запускает Windows PowerShell)") : ""));
+        for (const [name, v] of f.tools) out.push(name + ": " + v);
+        if (missing.length) out.push(tr("not found: ", "не найдены: ") + missing.join(", "));
+        out.push("", "== ZeroIDE MCP ==");
+        out.push(tr("server: ", "сервер: ") + SERVER_VERSION + tr(", messages in ", ", язык сообщений: ") + LANG);
+        out.push(tr("project dir (base for relative paths): ", "папка проекта (база для относительных путей): ") + PROJECT_DIR);
+        out.push(tr("your access: ", "твой доступ: ") + (caller.scope || "full") + (caller.label && caller.label !== "legacy" ? " (" + caller.label + ")" : ""));
+        out.push(tr("folder confinement: ", "ограничение папкой: ") + (confined ? conf.root + tr(" (terminal disabled)", " (терминал отключён)") : tr("off", "выкл.")));
+        out.push(tr("run without asking: ", "без подтверждения: ") + (groups.allow.join(", ") || "—"));
+        out.push(tr("ask the owner first: ", "с подтверждением владельца: ") + (groups.ask.join(", ") || "—"));
+        out.push(tr("disabled by the owner: ", "отключены владельцем: ") + (groups.deny.join(", ") || "—"));
+        out.push(tr("approval timeout: ", "время на подтверждение: ") + (Number(perms.approvalTimeoutSec) || 60) + tr(" s", " с"));
+        out.push(tr("active temporary grants: ", "временные разрешения: ") + (grants.join("; ") || "—"));
+        const gateOff = gate.enabled === false || (gate.askAtOrAbove === "none" && gate.grantsNeverCover === "none");
+        let gateDesc;
+        if (gateOff) {
+          gateDesc = tr("off (full autonomy for allowed tools)", "выкл. (полная автономия для разрешённых инструментов)");
+        } else if (gate.askAtOrAbove === "critical") {
+          gateDesc = gate.grantsNeverCover === "none"
+            ? tr("critical calls still ask; temporary grants may cover them", "критичные вызовы спрашивают; временные разрешения могут их покрывать")
+            : tr("high-risk runs silently when allowed; critical calls always ask (no temporary grant)", "высокий риск не спрашивает при разрешении; критичные вызовы всегда спрашивают (без временных разрешений)");
+        } else {
+          gateDesc = gate.grantsNeverCover === "none"
+            ? tr("high-risk and critical calls ask on first use; temporary grants may cover them", "высокий и критичный риск спрашивают; временные разрешения могут их покрывать")
+            : tr("high-risk calls always ask; no temporary grant covers a critical call", "вызовы с высоким риском всегда спрашивают; временные разрешения не покрывают критичные");
+        }
+        out.push(tr("risk check: ", "проверка риска: ") + gateDesc);
+        out.push(tr("undo history: ", "история для отката: ") + HISTORY_DIR + " (" + HISTORY_RETENTION_DAYS + tr(" days; write_file, edit_file and file_ops are recorded)", " дн.; записываются write_file, edit_file и file_ops)"));
+        out.push(tr("tip: group related replacements into one edit_file call (edits[]) so the owner approves once.", "совет: объединяй связанные замены в один вызов edit_file (edits[]), чтобы владелец подтверждал один раз."));
+        return textResult(out.join("\n"));
+      } catch (e) {
         return errResult(e);
       }
     }
@@ -2951,8 +4778,9 @@ function makeServer(ctx) {
         openWorldHint: false,
       },
     },
-    async ({ summary, outcome, next, commit, refs, continuesFromSeq }) => {
+    async ({ summary, outcome, next, commit, refs, continuesFromSeq }, extra) => {
       try {
+        const slot = extra?.agentSlot;
         const session = sessionRef.sessionId;
         const effectiveSince =
           continuesFromSeq != null ? continuesFromSeq : lastJournalToSeq;
@@ -2975,18 +4803,33 @@ function makeServer(ctx) {
         lastJournalToSeq =
           auditRange.toSeq != null ? auditRange.toSeq : effectiveSince;
         mutatingSinceJournal = 0;
-        return textResult(
-          [
-            tr("OK: journal entry added.", "OK: запись в журнал добавлена."),
-            "seq: " + seq,
-            "session: " + session,
-            "outcome: " + outcome,
-            "audit_range: " +
-              (auditRange.count
-                ? "seq " + auditRange.fromSeq + "-" + auditRange.toSeq + " (" + auditRange.count + tr(" entries)", " записей)")
-                : tr("(no new audit entries in this session)", "(нет новых audit-записей в этой session)")),
-          ].join("\n")
-        );
+        const lines = [
+          tr("OK: journal entry added.", "OK: запись в журнал добавлена."),
+          "seq: " + seq,
+          "session: " + session,
+          "outcome: " + outcome,
+          "audit_range: " +
+            (auditRange.count
+              ? "seq " + auditRange.fromSeq + "-" + auditRange.toSeq + " (" + auditRange.count + tr(" entries)", " записей)")
+              : tr("(no new audit entries in this session)", "(нет новых audit-записей в этой session)")),
+        ];
+        if (slot && outcome === "done" && !slot.hasEverSentUserMessage) {
+          lines.push(
+            tr(
+              `reminder: Send a short summary to the tray via user_message({ agent: "${slot.agentName}", text: "...", kind: "status" }) before finishing.`,
+              `напоминание: Отправь краткий итог в трей через user_message({ agent: "${slot.agentName}", text: "...", kind: "status" }) перед завершением.`
+            )
+          );
+        }
+        if (slot && outcome === "done" && holdAfterTask && isAwaitOwnerEnabled()) {
+          lines.push(
+            tr(
+              `[HOLD_AFTER_TASK_ENABLED_BY_OWNER]: The owner explicitly turned ON tray standby right now. Do NOT end your turn in chat — call await_owner({ agent: "${slot.agentName}", summary: "..." }) immediately!`,
+              `[HOLD_AFTER_TASK_ENABLED_BY_OWNER]: Владелец вручную включил удержание в трее на 5 минут. НЕ закрывай ход в чате — сразу вызови await_owner({ agent: "${slot.agentName}", summary: "..." })!`
+            )
+          );
+        }
+        return textResult(lines.join("\n"));
       } catch (e) {
         return errResult(e);
       }
@@ -3216,7 +5059,105 @@ app.get("/local/status", (req, res) => {
     oauth: (() => { const s = loadOAuth(); return { clients: s.clients.length, families: s.families.filter((x) => !x.revoked).length, enabled: OAUTH_ENABLED }; })(),
     confinement: (() => { const p = loadPermissions(); return p.confinement && p.confinement.enabled ? { enabled: true, root: p.confinement.root || null } : { enabled: false, root: null }; })(),
     recentEvents: recentEvents.slice(-30),
+    activeAgents: Array.from(agentRegistry.values()).map((a) => {
+      const trulyWaiting =
+        a.standbyUntilMs > Date.now() &&
+        (a.standbyActiveCalls > 0 || a.standbyPulseGraceUntilMs > Date.now());
+      return {
+        agentId: a.agentId,
+        agentName: a.agentName,
+        tokenLabel: a.tokenLabel,
+        title: a.title,
+        current: a.current,
+        done: a.done,
+        next: a.next,
+        status: trulyWaiting ? "waiting" : (a.taskState || "running"),
+        startedAt: a.startedAt,
+        completedAt: a.completedAt || "",
+        updatedAt: a.updatedAt,
+        lastTool: a.lastTool,
+        lastSeenAt: a.lastSeenAt,
+        userMessageText: a.userMessageText,
+        userMessageKind: a.userMessageKind,
+        standbyRemainingSec: trulyWaiting ? Math.max(1, Math.ceil((a.standbyUntilMs - Date.now()) / 1000)) : 0,
+      };
+    }),
+    ownerMessages: ownerMessageQueue.slice(-15),
+    chatHistory: chatHistory.slice(-15),
+    holdAfterTask,
   });
+});
+
+app.post("/local/hold-after-task", parseSmallJson, (req, res) => {
+  if (!checkControlAuth(req, res)) return;
+  const requested = Boolean(req.body && req.body.enabled);
+  holdAfterTask = requested && isAwaitOwnerEnabled();
+  audit({ event: "hold_after_task.toggled", enabled: holdAfterTask, ok: true });
+  res.json({ ok: true, holdAfterTask });
+});
+
+app.post("/local/standby/release", parseSmallJson, (req, res) => {
+  if (!checkControlAuth(req, res)) return;
+  const agentId = normalizeAgentId((req.body && req.body.agentId) || "");
+  for (const slot of agentRegistry.values()) {
+    if (!agentId || slot.agentId === agentId) {
+      slot.standbyReleased = true;
+      slot.standbyUntilMs = 0;
+    }
+  }
+  notifyOwnerListeners();
+  res.json({ ok: true });
+});
+
+app.post("/local/owner-message", parseSmallJson, (req, res) => {
+  if (!checkControlAuth(req, res)) return;
+  const body = req.body || {};
+  const text = String(body.text || "").trim().slice(0, 2000);
+  if (!text) {
+    res.status(400).json({ error: "empty_text" });
+    return;
+  }
+  const to = String(body.to || "*").trim() || "*";
+  const stopCommand = Boolean(body.stopCommand);
+  const msg = enqueueOwnerMessage({ to, text, stopCommand, from: "owner" });
+  res.json({ ok: true, message: msg });
+});
+
+app.post("/local/owner-message/cancel", parseSmallJson, (req, res) => {
+  if (!checkControlAuth(req, res)) return;
+  const id = String((req.body && req.body.id) || "");
+  let cancelled = 0;
+  for (const m of ownerMessageQueue) {
+    if (m.status === "queued" && (!id || m.id === id)) {
+      m.status = "cancelled";
+      cancelled++;
+    }
+  }
+  res.json({ ok: true, cancelled });
+});
+
+app.post("/local/agent-task/clear", parseSmallJson, (req, res) => {
+  if (!checkControlAuth(req, res)) return;
+  const agentId = normalizeAgentId((req.body && req.body.agentId) || "");
+  if (agentId && agentRegistry.has(agentId)) {
+    const slot = agentRegistry.get(agentId);
+    slot.title = "";
+    slot.current = "";
+    slot.done = [];
+    slot.next = [];
+    slot.startedAt = "";
+    slot.hasEverSetTask = false;
+  } else if (!agentId) {
+    for (const slot of agentRegistry.values()) {
+      slot.title = "";
+      slot.current = "";
+      slot.done = [];
+      slot.next = [];
+      slot.startedAt = "";
+      slot.hasEverSetTask = false;
+    }
+  }
+  res.json({ ok: true });
 });
 
 app.get("/local/grants", (req, res) => {
